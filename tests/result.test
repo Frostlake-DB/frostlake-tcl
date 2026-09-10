@@ -1,0 +1,71 @@
+# The result value: a plain dict, plus the accessors `dict get` cannot give.
+
+source [file join [file dirname [info script]] helper.tcl]
+namespace import -force ::tcltest::*
+
+proc samples {} {
+    set columns [list \
+        [dict create name ID datatype NUMBER nullable 0 precision 38 scale 0] \
+        [dict create name NAME datatype VARCHAR nullable 1 precision 0 scale 0]]
+    return [::frostlake::result new $columns {{1 Ada} {2 {Grace H}} {3 {}}}]
+}
+
+test result-1.1 {a result is a dict, readable without any accessor} -body {
+    set res [samples]
+    list [dict get $res rows] [llength [dict get $res columns]] [dict get $res updatecount]
+} -result {{{1 Ada} {2 {Grace H}} {3 {}}} 2 -1}
+
+test result-1.2 {the first cell of the first row} -body {
+    ::frostlake::result value [samples]
+} -result 1
+
+test result-1.3 {and the empty string when there is no first row} -body {
+    ::frostlake::result value [::frostlake::result new {} {}]
+} -result {}
+
+test result-2.1 {column names, in order} -body {
+    ::frostlake::result names [samples]
+} -result {ID NAME}
+
+test result-2.2 {a column looked up by name, case-insensitively, or by position} -body {
+    list [::frostlake::result columnindex [samples] NAME] \
+         [::frostlake::result columnindex [samples] name] \
+         [::frostlake::result columnindex [samples] 0] \
+         [::frostlake::result columnindex [samples] nope] \
+         [::frostlake::result columnindex [samples] 9]
+} -result {1 1 0 -1 -1}
+
+test result-2.3 {the column's own metadata} -body {
+    ::frostlake::result column [samples] name
+} -result {name NAME datatype VARCHAR nullable 1 precision 0 scale 0}
+
+test result-2.4 {a column that is not there says so} -body {
+    catch {::frostlake::result column [samples] missing} message options
+    list $message [lrange [dict get $options -errorcode] 0 1]
+} -result {{this result has no column "missing"} {FROSTLAKE USAGE}}
+
+test result-3.1 {one cell, by row and column} -body {
+    list [::frostlake::result cell [samples] 1 NAME] \
+         [::frostlake::result cell [samples] 1 0] \
+         [::frostlake::result cell [samples] 2 NAME]
+} -result {{Grace H} 2 {}}
+
+test result-3.2 {rows keyed by column name} -body {
+    ::frostlake::result dicts [samples]
+} -result {{ID 1 NAME Ada} {ID 2 NAME {Grace H}} {ID 3 NAME {}}}
+
+test result-4.1 {a query counts the rows it returned} -body {
+    list [::frostlake::result rowcount [samples]] [::frostlake::result isupdate [samples]] \
+         [::frostlake::result updatecount [samples]]
+} -result {3 0 -1}
+
+test result-4.2 {a DML result counts the rows it changed} -body {
+    set res [::frostlake::result new \
+        [list [dict create name {number of rows inserted} datatype NUMBER]] \
+        {{7}} 7 [dict create {number of rows inserted} 7]]
+    list [::frostlake::result rowcount $res] [::frostlake::result isupdate $res] \
+         [::frostlake::result updatecount $res] [::frostlake::result counters $res] \
+         [::frostlake::result rows $res]
+} -result {7 1 7 {{number of rows inserted} 7} {{7}}}
+
+cleanupTests

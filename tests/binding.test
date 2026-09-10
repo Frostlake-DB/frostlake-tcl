@@ -1,0 +1,153 @@
+# Parameter binding: what counts as a placeholder, and what a bound value
+# becomes.
+
+source [file join [file dirname [info script]] helper.tcl]
+namespace import -force ::tcltest::*
+
+proc bindnames {sql} { ::frostlake::bind names $sql }
+proc bindcount {sql} { ::frostlake::bind count $sql }
+proc pos {sql params {types {}}} { ::frostlake::bind positional $sql $params $types "" }
+proc nam {sql params {types {}}} { ::frostlake::bind named $sql $params $types "" }
+
+test bind-1.1 {positional markers are counted} -body {
+    list [bindcount {SELECT ?}] [bindcount {SELECT ?, ?, ?}] [bindcount {SELECT 1}]
+} -result {1 3 0}
+
+test bind-1.2 {a marker inside a literal, identifier or comment is not one} -body {
+    list [bindcount {SELECT '?'}] [bindcount {SELECT "?" FROM t}] \
+         [bindcount "SELECT 1 -- ?\n"] [bindcount {SELECT 1 /* ? */}] \
+         [bindcount {CREATE FUNCTION f() AS $$ ? $$}]
+} -result {0 0 0 0 0}
+
+test bind-2.1 {named markers count once each, however often they appear} -body {
+    list [bindcount {SELECT :a, :b, :a}] [bindnames {SELECT :a, :b, :a}]
+} -result {2 {A B}}
+
+test bind-2.2 {a cast and an assignment are not parameters} -body {
+    list [bindcount {SELECT '1'::INT}] [bindcount {SET x := 1}]
+} -result {0 0}
+
+test bind-2.3 {VARIANT path access is not a parameter} -body {
+    list [bindcount {SELECT v:field FROM t}] \
+         [bindcount {SELECT PARSE_JSON('{}'):k}] \
+         [bindcount {SELECT "V":k FROM t}] \
+         [bindcount {SELECT f(x):k}]
+} -result {0 0 0 0}
+
+test bind-2.4 {a positional reference :1 is the server's, not a name} -body {
+    bindcount {SELECT :1}
+} -result 0
+
+test bind-2.5 {mixing the two styles reports -1} -body {
+    bindcount {SELECT ?, :a}
+} -result -1
+
+test bind-3.1 {a positional bind becomes a quoted literal by default} -body {
+    pos {SELECT * FROM t WHERE a = ?} {hello}
+} -result {SELECT * FROM t WHERE a = 'hello'}
+
+test bind-3.2 {quotes and backslashes in a bound value cannot break out} -body {
+    pos {SELECT ?} [list {it's a \ backslash}]
+} -result {SELECT 'it''s a \\ backslash'}
+
+test bind-3.3 {several binds, in order} -body {
+    pos {INSERT INTO t VALUES (?, ?, ?)} {1 two 3}
+} -result {INSERT INTO t VALUES ('1', 'two', '3')}
+
+test bind-3.4 {named binds, matched case-insensitively and in any order} -body {
+    nam {SELECT :b, :A} {a 1 B 2}
+} -result {SELECT '2', '1'}
+
+test bind-3.5 {a name used twice is bound twice} -body {
+    nam {SELECT :x, :x} {x v}
+} -result {SELECT 'v', 'v'}
+
+test bind-4.1 {with no arguments the markers pass through to the server} -body {
+    list [pos {EXECUTE IMMEDIATE :v} {}] [pos {OPEN c USING (?)} {}]
+} -result {{EXECUTE IMMEDIATE :v} {OPEN c USING (?)}}
+
+test bind-5.1 {-types number renders a bare literal} -body {
+    pos {SELECT * FROM t LIMIT ?} {5} {number}
+} -result {SELECT * FROM t LIMIT 5}
+
+test bind-5.2 {one type spread over every placeholder} -body {
+    pos {SELECT ?, ?} {1 2} {number}
+} -result {SELECT 1, 2}
+
+test bind-5.3 {a type per placeholder} -body {
+    pos {SELECT ?, ?, ?} {5 true abc} {number boolean string}
+} -result {SELECT 5, TRUE, 'abc'}
+
+test bind-5.3b {named binds take their types as a dict, keyed like the parameters} -body {
+    list [nam {SELECT :n, :s} {n 5 s abc} {n number s string}] \
+         [nam {SELECT :n, :s} {n 5 S abc} {N number}] \
+         [nam {SELECT :a, :b} {a 1 b 2} {number}]
+} -result {{SELECT 5, 'abc'} {SELECT 5, 'abc'} {SELECT 1, 2}}
+
+test bind-5.4 {every type has a spelling} -body {
+    list [pos {SELECT ?} {2024-01-15} {date}] \
+         [pos {SELECT ?} {10:30:00} {time}] \
+         [pos {SELECT ?} {{2024-01-15 10:30:00}} {timestamp}] \
+         [pos {SELECT ?} {{2024-01-15 10:30:00 +0100}} {timestamptz}] \
+         [pos {SELECT ?} [list [binary format H* AB01]] {binary}] \
+         [pos {SELECT ?} {{{"a":1}}} {variant}] \
+         [pos {SELECT ?} {t} {raw}] \
+         [pos {SELECT ?} {anything} {null}]
+} -result {{SELECT '2024-01-15'::DATE} {SELECT '10:30:00'::TIME} {SELECT '2024-01-15 10:30:00'::TIMESTAMP_NTZ} {SELECT '2024-01-15 10:30:00 +01:00'::TIMESTAMP_TZ} {SELECT X'AB01'} {SELECT PARSE_JSON('{"a":1}')} {SELECT t} {SELECT NULL}}
+
+test bind-5.5 {the null stand-in binds as NULL whatever type was asked for} -body {
+    list [::frostlake::bind positional {SELECT ?} {{}} {} ""] \
+         [::frostlake::bind positional {SELECT ?} {NUL} {number} NUL]
+} -result {{SELECT NULL} {SELECT NULL}}
+
+test bind-5.6 {and with a sentinel null, an empty string is still a string} -body {
+    ::frostlake::bind positional {SELECT ?} [list ""] {} "(null)"
+} -result {SELECT ''}
+
+test bind-6.1 {too few or too many arguments} -body {
+    list [catch {pos {SELECT ?, ?} {1}} a] [catch {pos {SELECT ?} {1 2}} b] $a $b
+} -result {1 1 {the statement has 2 placeholder(s), got 1 argument(s)} {the statement has 1 placeholder(s), got 2 argument(s)}}
+
+test bind-6.2 {a name with no argument} -body {
+    catch {nam {SELECT :a, :b} {a 1}} message
+    set message
+} -result {no argument bound for :b}
+
+test bind-6.3 {an argument no placeholder mentions} -body {
+    catch {nam {SELECT :a} {a 1 spare 2}} message
+    set message
+} -result {argument(s) :spare do not appear in the statement}
+
+test bind-6.4 {the two styles may not be mixed} -body {
+    catch {pos {SELECT ?, :a} {1 2}} message
+    set message
+} -result {a statement may use ? or :name placeholders, not both}
+
+test bind-6.5 {a list where a dict was needed, and the reverse} -body {
+    list [catch {nam {SELECT ?} {1}} a] [catch {pos {SELECT :a} {1}} b] $a $b
+} -result {1 1 {the statement uses positional ? placeholders; pass a list of parameters instead of a dict} {the statement uses :name placeholders; pass a dict of named parameters instead of a list}}
+
+test bind-6.6 {an odd number of dict elements says what went wrong} -body {
+    catch {nam {SELECT :a} {a 1 b}} message
+    set message
+} -match glob -result {the statement uses :name placeholders, so its parameters are a dict*}
+
+test bind-6.7 {a wrong number of types} -body {
+    catch {pos {SELECT ?, ?} {1 2} {number boolean string}} message
+    set message
+} -match glob -result {-types has 3 entr(ies) for 2 placeholder(s)*}
+
+test bind-6.8 {a type that does not exist} -body {
+    catch {pos {SELECT ?} {1} {bigint}} message
+    set message
+} -match glob -result {unknown bind type "bigint" (expected string, number, *)}
+
+test bind-6.9 {a number bind needs a number, a boolean bind a boolean} -body {
+    list [catch {pos {SELECT ?} {abc} {number}} a] [catch {pos {SELECT ?} {maybe} {boolean}} b] $a $b
+} -result {1 1 {a number bind needs a number, got "abc"} {a boolean bind needs true or false, got "maybe"}}
+
+test bind-6.10 {parameters for a statement that has none} -body {
+    list [catch {pos {SELECT 1} {1}} a] [catch {nam {SELECT 1} {a 1}} b]
+} -result {1 1}
+
+cleanupTests

@@ -1,0 +1,582 @@
+# The transport, against an in-process server that can be made to do what a
+# real engine will not do on demand: chunk a body, close a keep-alive socket,
+# answer something that is not JSON, or never answer at all.
+
+source [file join [file dirname [info script]] helper.tcl]
+namespace import -force ::tcltest::*
+
+namespace eval tt {
+    variable seen {}
+    variable reply {}
+    variable healthbody {}
+
+    # Records every statement and answers with `reply`, which may be a script
+    # evaluated per statement.
+    proc handler {method path headers body} {
+        variable seen
+        variable reply
+        variable healthbody
+        if {$path eq "/api/health"} {
+            if {$healthbody ne ""} { return [dict create body $healthbody] }
+            return [dict create body [::fakeserver::healthy]]
+        }
+        set decoded [::frostlake::json parse $body]
+        set sql [::frostlake::json value [::frostlake::json at $decoded sql]]
+        set session [::frostlake::json at $decoded sessionId]
+        lappend seen $sql
+        return [uplevel #0 [list apply {{sql session} {
+            eval $::tt::reply
+        }} $sql $session]]
+    }
+
+    proc reset {answer {health {}}} {
+        variable seen {}
+        variable reply $answer
+        variable healthbody $health
+    }
+}
+
+proc newserver {} { return [::fakeserver::start ::tt::handler] }
+
+# -------------------------------------------------------------- keep-alive
+
+test transport-1.1 {every statement rides one socket} -body {
+    tt::reset {dict create body [::fakeserver::ok]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        for {set i 0} {$i < 25} {incr i} { $conn execute {SELECT 1} }
+        $conn close
+        dict get [::fakeserver::stats $id] connections
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result 1
+
+test transport-1.2 {a server that says Connection: close gets a fresh socket} -body {
+    tt::reset {dict create body [::fakeserver::ok] close 1}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        $conn execute {SELECT 1}
+        $conn execute {SELECT 2}
+        $conn execute {SELECT 3}
+        $conn close
+        list [dict get [::fakeserver::stats $id] connections] [llength $tt::seen]
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {3 3}
+
+test transport-1.3 {a chunked body is reassembled} -body {
+    tt::reset {dict create chunked 1 body [::fakeserver::ok \
+        {[{"columns":[{"dataType":"VARCHAR","name":"V"}],"rows":[["a value split across chunks"]]}]}]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        set out [::frostlake::result value [$conn execute {SELECT 1}]]
+        $conn close
+        set out
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {a value split across chunks}
+
+test transport-1.4 {a UTF-8 payload survives both directions} -body {
+    tt::reset {dict create body [::fakeserver::ok \
+        "\[{\"columns\":\[{\"dataType\":\"VARCHAR\",\"name\":\"V\"}\],\"rows\":\[\[[::frostlake::json encode_string $sql]\]\]}\]"]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        set out [::frostlake::result value [$conn execute {SELECT 'café 日本 — ok'}]]
+        $conn close
+        set out
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {SELECT 'café 日本 — ok'}
+
+# ------------------------------------------------------------------ session
+
+test transport-2.1 {the session id is echoed back on every later statement} -body {
+    tt::reset {dict create body [::fakeserver::ok {[]} sess-42]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        $conn execute {SELECT 1}
+        set first [$conn sessionid]
+        $conn execute {SELECT 2}
+        $conn close
+        set first
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result sess-42
+
+test transport-2.2 {a failure answers sessionId null, and must not drop the session} -body {
+    tt::reset {
+        if {[string match "*BAD*" $sql]} {
+            dict create status 500 body [::fakeserver::failed "it failed"]
+        } else {
+            dict create body [::fakeserver::ok {[]} keep-me]
+        }
+    }
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        $conn execute {SELECT 1}
+        catch {$conn execute {SELECT BAD}}
+        set after [$conn sessionid]
+        $conn close
+        set after
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result keep-me
+
+test transport-2.3 {a lapsed connection puts the DSN's scope back on} -body {
+    tt::reset {dict create body [::fakeserver::ok]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect "[::fakeserver::dsn $id]/MY_DB?schema=S" -idlelimit 50ms]
+        $conn execute {SELECT 1}
+        after 100
+        $conn execute {SELECT 2}
+        $conn close
+        set tt::seen
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {{USE DATABASE "MY_DB"} {USE SCHEMA "S"} {SELECT 1} {USE DATABASE "MY_DB"} {USE SCHEMA "S"} {SELECT 2}}
+
+test transport-2.4 {but not once the caller has chosen a scope themselves} -body {
+    tt::reset {dict create body [::fakeserver::ok]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect "[::fakeserver::dsn $id]/MY_DB" -idlelimit 50ms]
+        $conn execute {USE DATABASE other}
+        after 100
+        $conn execute {SELECT 2}
+        $conn close
+        set tt::seen
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {{USE DATABASE "MY_DB"} {USE DATABASE other} {SELECT 2}}
+
+test transport-2.5 {a USE that fails stays owed, rather than being skipped} -body {
+    tt::reset {
+        if {[string match "USE DATABASE*" $sql]} {
+            dict create status 500 body [::fakeserver::failed "Database 'NOPE' does not exist"]
+        } else {
+            dict create body [::fakeserver::ok]
+        }
+    }
+    set id [newserver]
+    try {
+        catch {::frostlake::connect "[::fakeserver::dsn $id]/NOPE"} message
+        ::helper::flatten $message
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {Database 'NOPE' does not exist}
+
+# ------------------------------------------------------------------- errors
+
+test transport-3.1 {a body that is not JSON names the address that answered} -body {
+    tt::reset {dict create body "<html>502 Bad Gateway</html>"}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        catch {$conn execute {SELECT 1}} message options
+        $conn close
+        list [::helper::flatten $message] [lrange [dict get $options -errorcode] 0 1]
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -match glob -result {{http://127.0.0.1:*/api/execute answered HTTP 200 with a body that is not a Frostlake response: <html>502 Bad Gateway</html>} {FROSTLAKE CONNECTION}}
+
+test transport-3.2 {a refused statement carries the engine's own wording} -body {
+    tt::reset {dict create status 500 body [::fakeserver::failed \
+        "SQL compilation error:\nObject 'T' does not exist or not authorized."]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        catch {$conn execute {SELECT * FROM t}} message options
+        $conn close
+        list [::helper::flatten $message] \
+             [lrange [dict get $options -errorcode] 0 1] \
+             [dict get [::frostlake::detail [dict get $options -errorcode]] status]
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {{SQL compilation error: Object 'T' does not exist or not authorized.} {FROSTLAKE QUERY} 500}
+
+test transport-3.3 {the error detail carries the statement as it was sent} -body {
+    tt::reset {dict create status 500 body [::fakeserver::failed "no"]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        catch {$conn execute {SELECT ?} {secret}} message options
+        $conn close
+        dict get [::frostlake::detail [dict get $options -errorcode]] statement
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {SELECT 'secret'}
+
+test transport-3.4 {the endpoint's own 400 shape is reported too} -body {
+    tt::reset {dict create status 400 body {{"error":"SQL is required"}}}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        catch {$conn execute { }} message
+        $conn close
+        set message
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {SQL is required}
+
+test transport-3.5 {a failure with no message at all still says something} -body {
+    tt::reset {dict create status 500 body {{"success":false}}}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        catch {$conn execute {SELECT 1}} message
+        $conn close
+        set message
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -match glob -result {the statement failed with HTTP 500 and no error message:*}
+
+test transport-3.6 {a health endpoint that is not an engine's is not healthy} -body {
+    tt::reset {dict create body [::fakeserver::ok]} {{"greeting":"hello"}}
+    set id [newserver]
+    try {
+        catch {::frostlake::connect [::fakeserver::dsn $id]} message options
+        list [string match {*is not a Frostlake response*} $message] \
+             [lrange [dict get $options -errorcode] 0 1]
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {1 {FROSTLAKE CONNECTION}}
+
+test transport-3.7 {a server that never answers gives up when it said it would} -body {
+    tt::reset {dict create silent 1}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id] -timeout 300ms]
+        catch {$conn execute {SELECT 1}} message options
+        list [string match {*did not answer within 300ms} $message] \
+             [lrange [dict get $options -errorcode] 0 1]
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {1 {FROSTLAKE CONNECTION}}
+
+test transport-3.8 {a torn connection is reported, and never silently re-sent} -body {
+    tt::reset {dict create raw "HTTP/1.1 200 OK\r\nContent-Length: 400\r\n\r\nshort"}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        catch {$conn execute {INSERT INTO t VALUES (1)}} message
+        $conn close
+        list [string match {*closed the connection mid-response} $message] [llength $tt::seen]
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {1 1}
+
+test transport-3.9 {a reply that is not HTTP at all} -body {
+    tt::reset {dict create raw "hello, this is not a web server\r\n\r\n"}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        catch {$conn execute {SELECT 1}} message
+        $conn close
+        string match {*answered something that is not HTTP:*} $message
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result 1
+
+# ------------------------------------------------------------- result shape
+
+test transport-4.1 {several result sets come back in order} -body {
+    tt::reset {dict create body [::fakeserver::ok {[
+        {"columns":[{"dataType":"NUMBER","name":"A"}],"rows":[[1]]},
+        {"columns":[{"dataType":"NUMBER","name":"B"}],"rows":[[2]]},
+        {"columns":[{"dataType":"NUMBER","name":"C"}],"rows":[[3]]}]}]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        set all [$conn executeall {SELECT 1; SELECT 2; SELECT 3}]
+        set one [::frostlake::result value [$conn execute {SELECT 1; SELECT 2; SELECT 3}]]
+        $conn close
+        list [llength $all] [lmap r $all {::frostlake::result value $r}] $one
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {3 {1 2 3} 1}
+
+test transport-4.2 {a statement with no grid still answers with one result} -body {
+    tt::reset {dict create body [::fakeserver::ok]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        set res [$conn execute {CREATE TABLE t (i INT)}]
+        $conn close
+        list [::frostlake::result names $res] [::frostlake::result rows $res] \
+             [::frostlake::result isupdate $res]
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {{} {} 0}
+
+test transport-4.3 {a DML status grid becomes an update count, grid kept} -body {
+    tt::reset {dict create body [::fakeserver::ok {[{"columns":[
+        {"dataType":"NUMBER","name":"number of rows inserted"},
+        {"dataType":"NUMBER","name":"number of rows updated"},
+        {"dataType":"NUMBER","name":"number of multi-joined rows updated"}],
+        "rows":[[3,2,1]]}]}]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        set res [$conn execute {MERGE INTO t USING s ON 1=1}]
+        $conn close
+        list [::frostlake::result updatecount $res] [::frostlake::result rows $res] \
+             [dict get [::frostlake::result counters $res] {number of multi-joined rows updated}]
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {5 {{3 2 1}} 1}
+
+test transport-4.4 {cells keep their JSON type, and null takes the stand-in} -body {
+    tt::reset {dict create body [::fakeserver::ok {[{"columns":[
+        {"dataType":"NUMBER","name":"N"},{"dataType":"VARCHAR","name":"S"},
+        {"dataType":"BOOLEAN","name":"B"},{"dataType":"VARCHAR","name":"Z"}],
+        "rows":[[12345678901234567890,"hi",true,null]]}]}]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id] -nullvalue <NULL>]
+        set res [$conn execute {SELECT 1}]
+        $conn close
+        lindex [::frostlake::result rows $res] 0
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {12345678901234567890 hi true <NULL>}
+
+test transport-4.4b {a cell that reads as NaN is handed back as it arrived} -body {
+    # The engine sends a non-finite DOUBLE as the JSON string "NaN". A driver
+    # that ran cells through arithmetic on the way out would turn that into a
+    # domain error instead of a value; this one does not touch it.
+    tt::reset {dict create body [::fakeserver::ok {[{"columns":[
+        {"dataType":"DOUBLE","name":"N"},{"dataType":"DOUBLE","name":"I"}],
+        "rows":[["NaN","Infinity"]]}]}]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        set res [$conn execute {SELECT SQRT(-1)}]
+        $conn close
+        lindex [::frostlake::result rows $res] 0
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {NaN Infinity}
+
+test transport-4.5 {a row shorter than the header is padded, not left ragged} -body {
+    tt::reset {dict create body [::fakeserver::ok {[{"columns":[
+        {"dataType":"NUMBER","name":"A"},{"dataType":"NUMBER","name":"B"}],
+        "rows":[[1]]}]}]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id] -nullvalue NIL]
+        set res [$conn execute {SELECT 1}]
+        $conn close
+        ::frostlake::result dicts $res
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {{A 1 B NIL}}
+
+test transport-4.6 {column metadata the server omitted is empty, not invented} -body {
+    tt::reset {dict create body [::fakeserver::ok {[{"columns":[
+        {"dataType":"VARCHAR","name":"V"}],"rows":[["x"]]}]}]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        set res [$conn execute {SELECT 1}]
+        $conn close
+        ::frostlake::result column $res V
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {name V datatype VARCHAR nullable {} precision {} scale {}}
+
+# ------------------------------------------------------------------- usage
+
+test transport-5.1 {a closed connection is gone, and says so} -body {
+    tt::reset {dict create body [::fakeserver::ok]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        $conn close
+        catch {$conn execute {SELECT 1}} message
+        string match {invalid command name*} $message
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result 1
+
+test transport-5.2 {a transaction sends BEGIN and COMMIT around its script} -body {
+    tt::reset {dict create body [::fakeserver::ok]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        $conn transaction { $conn execute {INSERT INTO t VALUES (1)} }
+        catch {$conn transaction { error "no" }}
+        $conn close
+        set tt::seen
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {BEGIN {INSERT INTO t VALUES (1)} COMMIT BEGIN ROLLBACK}
+
+test transport-5.3 {autocommit follows the transaction, and is restored on failure} -body {
+    tt::reset {dict create body [::fakeserver::ok]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        set during ""
+        $conn transaction { set during [$conn intransaction] }
+        set out [list $during [$conn intransaction]]
+        catch {$conn transaction { error "no" }}
+        lappend out [$conn intransaction]
+        $conn close
+        set out
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {1 0 0}
+
+test transport-5.4 {`render` shows the statement without sending it} -body {
+    tt::reset {dict create body [::fakeserver::ok]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        set out [$conn render {SELECT ?, ?} {5 abc} -types {number string}]
+        $conn close
+        list $out $tt::seen
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {{SELECT 5, 'abc'} {}}
+
+test transport-5.5 {a parameter list starting with a dash needs the -- guard} -body {
+    tt::reset {dict create body [::fakeserver::ok]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        set out [$conn render {SELECT ?} -- {-5}]
+        $conn close
+        set out
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {SELECT '-5'}
+
+test transport-5.6 {a second statement started mid-flight is refused, not interleaved} -body {
+    # The server's handler runs in the event loop the driver is waiting in, so
+    # calling back into the connection from there is exactly the reentrancy an
+    # application with its own file events can produce.
+    variable ::tt::nested "not attempted"
+    proc reenter {method path headers body} {
+        if {$path eq "/api/health"} { return [dict create body [::fakeserver::healthy]] }
+        if {[info exists ::tt::inner]} {
+            catch {$::tt::inner execute {SELECT 2}} ::tt::nested
+        }
+        return [dict create body [::fakeserver::ok]]
+    }
+    set id [::fakeserver::start reenter]
+    try {
+        set ::tt::inner [::frostlake::connect [::fakeserver::dsn $id]]
+        $::tt::inner execute {SELECT 1}
+        $::tt::inner close
+        unset ::tt::inner
+        set ::tt::nested
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -match glob -result {this connection is already running a statement*}
+
+test transport-5.7 {an unknown connect option is refused} -body {
+    tt::reset {dict create body [::fakeserver::ok]}
+    set id [newserver]
+    try {
+        catch {::frostlake::connect [::fakeserver::dsn $id] -notanoption 1} a
+        catch {::frostlake::connect [::fakeserver::dsn $id] -timeout} b
+        list [string match {unknown option "-notanoption"*} $a] $b
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {1 {option "-timeout" has no value}}
+
+test transport-5.8 {break, continue and return in a transaction act on the caller, after the commit} -body {
+    tt::reset {dict create body [::fakeserver::ok]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        proc ::tt::early {conn} {
+            $conn transaction { return early }
+            return late
+        }
+        set out {}
+        foreach x {1 2 3 4} {
+            $conn transaction {
+                if {$x == 2} continue
+                if {$x == 3} break
+            }
+            lappend out $x
+        }
+        set result [list $out [::tt::early $conn] [$conn intransaction] $tt::seen]
+        $conn close
+        set result
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {1 early 0 {BEGIN COMMIT BEGIN COMMIT BEGIN COMMIT BEGIN COMMIT}}
+
+# ------------------------------------------------------------------- https
+
+# HTTPS rides TclTLS, which is not part of the Tcl core. Where it is absent the
+# driver has to say so plainly rather than failing as some generic socket
+# problem -- that message is the whole difference between "install a package"
+# and an afternoon of packet captures.
+testConstraint notls [catch {package require tls}]
+
+test transport-6.1 {an https DSN without TclTLS names the missing package} -constraints notls -body {
+    catch {::frostlake::connect https://127.0.0.1:1 -connecttimeout 1s} message options
+    list [string match {an https DSN needs the TclTLS package*} $message] \
+         [lrange [dict get $options -errorcode] 0 1]
+} -result {1 {FROSTLAKE CONNECTION}}
+
+test transport-6.2 {TLS options on a plain DSN are refused, not quietly ignored} -body {
+    tt::reset {dict create body [::fakeserver::ok]}
+    set id [newserver]
+    try {
+        catch {::frostlake::connect [::fakeserver::dsn $id] -verify 0} a
+        catch {::frostlake::connect [::fakeserver::dsn $id] -cacert /tmp/ca.pem} b
+        list $a $b
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {{-cacert and -verify apply to https DSNs only} {-cacert and -verify apply to https DSNs only}}
+
+test transport-6.3 {tls=true in a frostlake:// DSN switches the scheme} -body {
+    ::frostlake::dsn baseurl [::frostlake::dsn parse frostlake://h:9?tls=true]
+} -result https://h:9
+
+cleanupTests

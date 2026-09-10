@@ -1,0 +1,93 @@
+# Value helpers: type names, literals, and the conversions the driver offers
+# but never applies behind a caller's back.
+
+source [file join [file dirname [info script]] helper.tcl]
+namespace import -force ::tcltest::*
+
+test value-1.1 {a parameterised type name reduces to its base} -body {
+    lmap t {{NUMBER(38,0)} {number(10, 2)} VARCHAR { TIMESTAMP_NTZ }} {
+        ::frostlake::value basetype $t
+    }
+} -result {NUMBER NUMBER VARCHAR TIMESTAMP_NTZ}
+
+test value-1.2 {which declared types are temporal, and how} -body {
+    lmap t {DATE TIME TIMESTAMP TIMESTAMP_NTZ DATETIME TIMESTAMP_TZ TIMESTAMP_LTZ VARCHAR} {
+        ::frostlake::value istemporal $t
+    }
+} -result {date time naive naive naive zoned zoned {}}
+
+test value-1.3 {and which are binary} -body {
+    lmap t {BINARY VARBINARY {BINARY(16)} VARCHAR} {::frostlake::value isbinary $t}
+} -result {1 1 1 0}
+
+test value-1.4 {the bind types are discoverable} -body {
+    set types [::frostlake::value types]
+    list [lindex $types 0] [expr {"number" in $types}] [expr {"nosuchtype" in $types}]
+} -result {string 1 0}
+
+test value-2.1 {a string literal doubles quotes and backslashes} -body {
+    ::frostlake::value literal {it's a \ back} string
+} -result {'it''s a \\ back'}
+
+test value-2.2 {a number literal keeps its digits, at any width} -body {
+    lmap v {0 -1 1.5 1e10 12345678901234567890123456789} {
+        ::frostlake::value literal $v number
+    }
+} -result {0 (-1) 1.5 1e10 12345678901234567890123456789}
+
+test value-2.3 {booleans in every spelling Tcl accepts} -body {
+    lmap v {1 0 true false yes no on off} {::frostlake::value literal $v boolean}
+} -result {TRUE FALSE TRUE FALSE TRUE FALSE TRUE FALSE}
+
+test value-2.4 {a zoned literal gets the colon the engine needs to parse it} -body {
+    list [::frostlake::value literal {2024-01-15 10:30:00 +0100} timestamptz] \
+         [::frostlake::value literal {2024-01-15 10:30:00 +01:00} timestamptz] \
+         [::frostlake::value literal {2024-01-15 10:30:00 -0530} timestamptz]
+} -result {{'2024-01-15 10:30:00 +01:00'::TIMESTAMP_TZ} {'2024-01-15 10:30:00 +01:00'::TIMESTAMP_TZ} {'2024-01-15 10:30:00 -05:30'::TIMESTAMP_TZ}}
+
+test value-2.5 {an identifier assembled at runtime is quoted} -body {
+    list [::frostlake::value identifier my_table] [::frostlake::value identifier {a"b}]
+} -result {{"my_table"} {"a""b"}}
+
+test value-3.1 {hex text and bytes convert both ways} -body {
+    set bytes [::frostlake::value hextobinary AB0102]
+    list [string length $bytes] [::frostlake::value binarytohex $bytes] \
+         [::frostlake::value binarytohex [::frostlake::value hextobinary ""]]
+} -result {3 AB0102 {}}
+
+test value-3.2 {lower-case hex reads, and upper-case comes back} -body {
+    ::frostlake::value binarytohex [::frostlake::value hextobinary deadbeef]
+} -result DEADBEEF
+
+test value-3.3 {text that is not hex is refused rather than half-read} -body {
+    list [catch {::frostlake::value hextobinary ABC}] [catch {::frostlake::value hextobinary xy}]
+} -result {1 1}
+
+test value-4.1 {a timestamp reads as an instant, a fraction and an offset} -body {
+    ::frostlake::value parsetimestamp {2024-01-15 10:30:00.123456789 +01:00}
+} -result {seconds 1705311000 nanos 123456789 offset 3600}
+
+test value-4.2 {an offset without its colon, and Z, and none at all} -body {
+    lmap t {{2024-01-15 10:30:00 +0100} {2024-01-15 10:30:00 Z} {2024-01-15 10:30:00}} {
+        dict get [::frostlake::value parsetimestamp $t] offset
+    }
+} -result {3600 0 0}
+
+test value-4.3 {a bare date, and a bare time} -body {
+    list [dict get [::frostlake::value parsetimestamp 2024-01-15] seconds] \
+         [dict get [::frostlake::value parsetimestamp 10:30:00] seconds] \
+         [dict get [::frostlake::value parsetimestamp 10:30:00.5] nanos]
+} -result {1705276800 37800 500000000}
+
+test value-4.4 {and back out again} -body {
+    list [::frostlake::value formattimestamp 1705311000 123456789 3600] \
+         [::frostlake::value formattimestamp 1705311000] \
+         [::frostlake::value formattimestamp 1705311000 0 -19800]
+} -result {{2024-01-15 10:30:00.123456789 +01:00} {2024-01-15 09:30:00} {2024-01-15 04:00:00 -05:30}}
+
+test value-4.5 {text that is not a temporal says so} -body {
+    catch {::frostlake::value parsetimestamp {not a date}} message
+    set message
+} -result {cannot read "not a date" as a date or time}
+
+cleanupTests

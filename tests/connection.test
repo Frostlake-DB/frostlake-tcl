@@ -1,0 +1,260 @@
+# Against a real engine. Nothing here is stubbed: every statement travels the
+# driver's own socket to a DatabaseHttpServer.
+#
+# Without FROSTLAKE_CLASSPATH there is no engine, and every case here skips --
+# a green run that never reached one would say less than a skipped one.
+
+source [file join [file dirname [info script]] helper.tcl]
+namespace import -force ::tcltest::*
+
+testConstraint engine [::testserver::available]
+if {![::testserver::available]} {
+    puts [outputChannel] "  skipping: [::testserver::skipreason]"
+}
+
+namespace eval ct {
+    variable conn ""
+
+    proc conn {} {
+        variable conn
+        if {$conn eq ""} {
+            set conn [::frostlake::connect [dict get [::testserver::shared] dsn]]
+            $conn execute {CREATE OR REPLACE DATABASE tcl_test_db}
+            $conn execute {USE DATABASE tcl_test_db}
+            $conn execute {CREATE OR REPLACE SCHEMA tcl_test_schema}
+            $conn execute {USE SCHEMA tcl_test_schema}
+        }
+        return $conn
+    }
+
+    proc scalar {sql args} {
+        return [::frostlake::result value [[conn] execute $sql {*}$args]]
+    }
+
+    proc dsn {} { return [dict get [::testserver::shared] dsn] }
+}
+
+test conn-1.1 {a connection reaches the engine and gets a session} -constraints engine -body {
+    set c [ct::conn]
+    list [expr {[$c sessionid] ne ""}] [$c isopen] [$c intransaction]
+} -result {1 1 0}
+
+test conn-1.2 {the DSN's scope is selected before the constructor returns} -constraints engine -body {
+    set c [::frostlake::connect "[ct::dsn]/TCL_TEST_DB?schema=TCL_TEST_SCHEMA"]
+    set out [list [::frostlake::result value [$c execute {SELECT CURRENT_DATABASE()}]] \
+                  [::frostlake::result value [$c execute {SELECT CURRENT_SCHEMA()}]]]
+    $c close
+    set out
+} -result {TCL_TEST_DB TCL_TEST_SCHEMA}
+
+test conn-1.3 {a database that does not exist is reported at connect time} -constraints engine -body {
+    catch {::frostlake::connect "[ct::dsn]/NO_SUCH_DATABASE"} message options
+    list [lrange [dict get $options -errorcode] 0 1] \
+         [string match {*NO_SUCH_DATABASE*} [::helper::flatten $message]]
+} -result {{FROSTLAKE QUERY} 1}
+
+test conn-1.4 {a port with nothing behind it fails as a connection problem} -constraints engine -body {
+    catch {::frostlake::connect frostlake://127.0.0.1:1 -connecttimeout 3s} message options
+    lrange [dict get $options -errorcode] 0 1
+} -result {FROSTLAKE CONNECTION}
+
+test conn-2.1 {round trip through a real table} -constraints engine -body {
+    set c [ct::conn]
+    $c execute {CREATE OR REPLACE TABLE people (id INTEGER, name VARCHAR, score NUMBER(10,2))}
+    set inserted [$c execute {INSERT INTO people VALUES (?, ?, ?)} {1 Ada 99.5}]
+    $c execute {INSERT INTO people VALUES (?, ?, ?)} [list 2 "Grace O'Hara" 88.25]
+    $c execute {INSERT INTO people VALUES (:id, :name, :score)} {id 3 name Bob score 70}
+    set res [$c execute {SELECT id, name, score FROM people ORDER BY id}]
+    list [::frostlake::result updatecount $inserted] \
+         [::frostlake::result names $res] \
+         [::frostlake::result rows $res]
+} -result {1 {ID NAME SCORE} {{1 Ada 99.50} {2 {Grace O'Hara} 88.25} {3 Bob 70.00}}}
+
+test conn-2.2 {a bound string is a string, however numeric it looks} -constraints engine -body {
+    set c [ct::conn]
+    $c execute {CREATE OR REPLACE TABLE codes (v VARCHAR)}
+    $c execute {INSERT INTO codes VALUES (?)} {007}
+    ct::scalar {SELECT v FROM codes}
+} -result 007
+
+test conn-2.3 {and -types number is how a real numeric literal is asked for} -constraints engine -body {
+    ::frostlake::result rows [[ct::conn] execute \
+        {SELECT id FROM people ORDER BY id LIMIT ?} 2 -types number]
+} -result {1 2}
+
+test conn-2.4 {DML reports what it changed} -constraints engine -body {
+    set c [ct::conn]
+    set updated [$c execute {UPDATE people SET score = 1 WHERE id > 1}]
+    set deleted [$c execute {DELETE FROM people WHERE id = 3}]
+    list [::frostlake::result updatecount $updated] [::frostlake::result isupdate $updated] \
+         [::frostlake::result updatecount $deleted] \
+         [::frostlake::result counters $deleted]
+} -result {2 1 1 {{number of rows deleted} 1}}
+
+test conn-2.5 {a query is not an update} -constraints engine -body {
+    set res [[ct::conn] execute {SELECT id FROM people}]
+    list [::frostlake::result isupdate $res] [::frostlake::result updatecount $res] \
+         [::frostlake::result rowcount $res]
+} -result {0 -1 2}
+
+test conn-3.1 {a NUMBER(38,0) keeps every digit, and Tcl can still add to it} -constraints engine -body {
+    set big [ct::scalar {SELECT 12345678901234567890123456789}]
+    list $big [expr {$big + 1}]
+} -result {12345678901234567890123456789 12345678901234567890123456790}
+
+test conn-3.2 {a NULL cell reads as the connection's stand-in} -constraints engine -body {
+    set c [::frostlake::connect [ct::dsn] -nullvalue <NULL>]
+    set out [::frostlake::result rows [$c execute {SELECT NULL, 'x', NULL}]]
+    $c close
+    set out
+} -result {{<NULL> x <NULL>}}
+
+test conn-3.3 {booleans read as words Tcl's own expr accepts} -constraints engine -body {
+    set res [[ct::conn] execute {SELECT TRUE AS A, FALSE AS B, 1=1 AS C}]
+    set row [lindex [::frostlake::result rows $res] 0]
+    list $row [expr {[lindex $row 0] && ![lindex $row 1]}]
+} -result {{true false true} 1}
+
+test conn-3.4 {the engine's own text for temporals, binary and semi-structured} -constraints engine -body {
+    ::frostlake::result rows [[ct::conn] execute {
+        SELECT '2024-01-15'::DATE,
+               '10:30:00'::TIME,
+               '2024-01-15 10:30:00'::TIMESTAMP_NTZ,
+               '2024-01-15 10:30:00 +01:00'::TIMESTAMP_TZ,
+               TO_BINARY('AB0102','HEX'),
+               PARSE_JSON('{"a":1}'),
+               ARRAY_CONSTRUCT(1,2)}]
+} -result {{2024-01-15 10:30:00 {2024-01-15 10:30:00.000} {2024-01-15 10:30:00.000 +0100} AB0102 {{"a":1}} {[1,2]}}}
+
+test conn-3.5 {and the helpers that convert it when a caller wants that} -constraints engine -body {
+    set row [lindex [::frostlake::result rows [[ct::conn] execute \
+        {SELECT '2024-01-15 10:30:00 +01:00'::TIMESTAMP_TZ AS T, TO_BINARY('AB0102','HEX') AS B}]] 0]
+    list [::frostlake::value parsetimestamp [lindex $row 0]] \
+         [string length [::frostlake::value hextobinary [lindex $row 1]]]
+} -result {{seconds 1705311000 nanos 0 offset 3600} 3}
+
+test conn-3.5b {a real NaN from the engine arrives as the text it sent} -constraints engine -body {
+    ::frostlake::result rows [[ct::conn] execute {SELECT SQRT(-1) AS N, 'NaN'::FLOAT AS F}]
+} -result {{NaN NaN}}
+
+test conn-3.6 {column metadata comes back with the grid} -constraints engine -body {
+    set res [[ct::conn] execute {SELECT 1::NUMBER(10,2) AS N, 'x' AS S}]
+    list [dict get [::frostlake::result column $res N] datatype] \
+         [dict get [::frostlake::result column $res N] scale] \
+         [dict get [::frostlake::result column $res S] datatype]
+} -result {NUMBER 2 VARCHAR}
+
+test conn-3.7 {UTF-8 survives the round trip} -constraints engine -body {
+    ct::scalar {SELECT ?} [list "café 日本 — ok"]
+} -result "café 日本 — ok"
+
+test conn-3.8 {a quote in a bound value cannot break out of its literal} -constraints engine -body {
+    ct::scalar {SELECT ?} [list "it's a ' quote"]
+} -result {it's a ' quote}
+
+test conn-4.1 {session state carries from one statement to the next} -constraints engine -body {
+    set c [::frostlake::connect [ct::dsn]]
+    $c execute {CREATE OR REPLACE DATABASE tcl_session_db}
+    $c execute {USE DATABASE tcl_session_db}
+    set out [::frostlake::result value [$c execute {SELECT CURRENT_DATABASE()}]]
+    $c close
+    set out
+} -result TCL_SESSION_DB
+
+test conn-4.2 {two connections are two sessions} -constraints engine -body {
+    set a [::frostlake::connect [ct::dsn]]
+    set b [::frostlake::connect [ct::dsn]]
+    $a execute {USE DATABASE tcl_session_db}
+    set out [list [::frostlake::result value [$a execute {SELECT CURRENT_DATABASE()}]] \
+                  [expr {[$a sessionid] ne [$b sessionid]}]]
+    $a close
+    $b close
+    set out
+} -result {TCL_SESSION_DB 1}
+
+test conn-5.1 {a committed transaction keeps its rows} -constraints engine -body {
+    set c [ct::conn]
+    $c execute {CREATE OR REPLACE TABLE acc (v INTEGER)}
+    $c transaction {
+        $c execute {INSERT INTO acc VALUES (1)}
+        $c execute {INSERT INTO acc VALUES (2)}
+    }
+    ct::scalar {SELECT COUNT(*) FROM acc}
+} -result 2
+
+test conn-5.2 {a failing one keeps none, and re-raises the original error} -constraints engine -body {
+    set c [ct::conn]
+    catch {
+        $c transaction {
+            $c execute {INSERT INTO acc VALUES (3)}
+            error "the caller changed their mind"
+        }
+    } message
+    list $message [ct::scalar {SELECT COUNT(*) FROM acc}] [$c intransaction]
+} -result {{the caller changed their mind} 2 0}
+
+test conn-5.3 {an explicit begin/rollback} -constraints engine -body {
+    set c [ct::conn]
+    $c begin
+    $c execute {INSERT INTO acc VALUES (9)}
+    set during [ct::scalar {SELECT COUNT(*) FROM acc}]
+    $c rollback
+    list $during [ct::scalar {SELECT COUNT(*) FROM acc}]
+} -result {3 2}
+
+test conn-6.1 {a statement the engine refuses carries its own wording} -constraints engine -body {
+    catch {[ct::conn] execute {SELECT * FROM no_such_table}} message options
+    list [lrange [dict get $options -errorcode] 0 1] \
+         [string match {*does not exist*} [::helper::flatten $message]] \
+         [dict get [::frostlake::detail [dict get $options -errorcode]] statement]
+} -result {{FROSTLAKE QUERY} 1 {SELECT * FROM no_such_table}}
+
+test conn-6.2 {a refused statement leaves the connection usable} -constraints engine -body {
+    set c [ct::conn]
+    catch {$c execute {SELECT nonsense syntax here}}
+    ct::scalar {SELECT 1}
+} -result 1
+
+test conn-6.3 {several result sets from one request} -constraints engine -body {
+    lmap r [[ct::conn] executeall {SELECT 1 AS A; SELECT 2 AS B; SELECT 3 AS C}] {
+        ::frostlake::result value $r
+    }
+} -result {1 2 3}
+
+test conn-7.1 {one socket carries a whole run of statements} -constraints engine -body {
+    set before [llength [chan names sock*]]
+    set c [::frostlake::connect [ct::dsn]]
+    for {set i 0} {$i < 100} {incr i} { $c execute {SELECT 1} }
+    set during [llength [chan names sock*]]
+    $c close
+    # One socket for a hundred statements, and none left over afterwards.
+    list [expr {$during - $before}] [expr {[llength [chan names sock*]] - $before}]
+} -result {1 0}
+
+test conn-7.2 {a connection re-opens after its socket has been taken away} -constraints engine -body {
+    set c [::frostlake::connect [ct::dsn]]
+    ::frostlake::result value [$c execute {SELECT 1}]
+    # Close the driver's socket behind its back, the way an idle sweep on the
+    # far side would. The next statement has to notice and re-open, rather than
+    # writing into a socket that is already gone.
+    foreach channel [chan names sock*] { catch {close $channel} }
+    set out [::frostlake::result value [$c execute {SELECT 2}]]
+    $c close
+    set out
+} -result 2
+
+test conn-8.1 {the connection tidies up after itself} -constraints engine -body {
+    set c [::frostlake::connect [ct::dsn]]
+    $c execute {SELECT 1}
+    $c close
+    expr {[llength [info commands $c]] == 0}
+} -result 1
+
+# ct::conn holds a connection open for the whole file; the engine itself is
+# released by all.tcl once every file has run.
+if {$ct::conn ne ""} {
+    catch {$ct::conn close}
+    set ct::conn ""
+}
+
+cleanupTests

@@ -1,0 +1,644 @@
+# The TDBC driver, tdbc::frostlake.
+#
+# The first half runs against the in-process fake server, so what the driver
+# sends and how it reads what comes back are checked without an engine. The
+# second half runs against a real one. Without the tdbc package every case
+# skips; without FROSTLAKE_CLASSPATH the engine-backed ones do.
+
+source [file join [file dirname [info script]] helper.tcl]
+namespace import -force ::tcltest::*
+
+testConstraint tdbc [expr {![catch {package require tdbc::frostlake}]}]
+testConstraint tdbcengine [expr {[testConstraint tdbc] && [::testserver::available]}]
+if {![testConstraint tdbc]} {
+    puts [outputChannel] "  skipping: the tdbc package is not installed"
+}
+
+namespace eval td {
+    # Every statement the fake server was sent, and the script that answers
+    # one -- evaluated with `sql` set to the statement.
+    variable seen {}
+    variable reply {dict create body [::fakeserver::ok]}
+
+    proc handler {method path headers body} {
+        variable seen
+        variable reply
+        if {$path eq "/api/health"} {
+            return [dict create body [::fakeserver::healthy]]
+        }
+        set decoded [::frostlake::json parse $body]
+        set sql [::frostlake::json value [::frostlake::json at $decoded sql]]
+        lappend seen $sql
+        return [apply [list sql $reply] $sql]
+    }
+
+    proc reset {{answer {dict create body [::fakeserver::ok]}}} {
+        variable seen {}
+        variable reply $answer
+    }
+
+    # A fake server and a connection `::db` to it; answers the server's id.
+    proc start {args} {
+        set id [::fakeserver::start ::td::handler]
+        ::tdbc::frostlake::connection create ::db [::fakeserver::dsn $id] {*}$args
+        return $id
+    }
+
+    proc stop {id} {
+        catch {::db close}
+        ::fakeserver::stop $id
+    }
+
+    # A resultSets array, one grid per `names rows` pair; `rows` is JSON text.
+    proc sets {args} {
+        set parts {}
+        foreach {names rows} $args {
+            set columns {}
+            foreach name $names {
+                lappend columns "{\"dataType\":\"VARCHAR\",\"name\":[::frostlake::json encode_string $name]}"
+            }
+            lappend parts "{\"columns\":\[[join $columns ,]\],\"rows\":$rows}"
+        }
+        return "\[[join $parts ,]\]"
+    }
+
+    # The first four elements of a failure's -errorcode.
+    proc code {options} {
+        return [lrange [dict get $options -errorcode] 0 3]
+    }
+}
+
+# ---------------------------------------------------------------- configure
+
+test tdbc-1.1 {TDBC's options, as the connection reports them} -constraints tdbc -setup {
+    td::reset
+    set id [td::start]
+} -body {
+    list [db configure] [db configure -iso] [db configure -encoding]
+} -cleanup {
+    td::stop $id
+} -result {{-encoding utf-8 -isolation readcommitted -readonly 0 -timeout 300000} readcommitted utf-8}
+
+test tdbc-1.2 {-timeout is TDBC's milliseconds, at connect time and after} -constraints tdbc -setup {
+    td::reset
+    set id [td::start -timeout 250]
+} -body {
+    set before [db configure -timeout]
+    db configure -timeout 0080
+    list $before [db configure -timeout] [[db getDBhandle] timeout]
+} -cleanup {
+    td::stop $id
+} -result {250 80 80}
+
+test tdbc-1.3 {a weaker isolation level is raised to readcommitted, a stronger one refused} -constraints tdbc -setup {
+    td::reset
+    set id [td::start]
+} -body {
+    db configure -isolation readuncommitted
+    catch {db configure -isolation serializable} message options
+    list [db configure -isolation] [td::code $options] $message
+} -cleanup {
+    td::stop $id
+} -result {readcommitted {TDBC FEATURE_NOT_SUPPORTED 0A000 FROSTLAKE} {isolation level "serializable" cannot be had: Frostlake isolates transactions at readcommitted, as Snowflake does}}
+
+test tdbc-1.4 {-readonly, -encoding and a bad value are refused with TDBC codes} -constraints tdbc -setup {
+    td::reset
+    set id [td::start]
+} -body {
+    set out {}
+    foreach pair {{-readonly 1} {-encoding iso8859-1} {-timeout soon} {-bogus 1}} {
+        catch {db configure {*}$pair} message options
+        lappend out [td::code $options]
+    }
+    db configure -readonly 0 -encoding UTF-8
+    set out
+} -cleanup {
+    td::stop $id
+} -result {{TDBC FEATURE_NOT_SUPPORTED 0A000 FROSTLAKE} {TDBC FEATURE_NOT_SUPPORTED 0A000 FROSTLAKE} {TDBC DATA_EXCEPTION 22018 FROSTLAKE} {TDBC GENERAL_ERROR HY000 FROSTLAKE}}
+
+test tdbc-1.5 {a bad option is refused before the server is contacted} -constraints tdbc -setup {
+    td::reset
+    set id [::fakeserver::start ::td::handler]
+} -body {
+    set out {}
+    foreach option {{-readonly 1} {-nullvalue x} {-c 1}} {
+        catch {::tdbc::frostlake::connection create ::db2 [::fakeserver::dsn $id] {*}$option} message
+        lappend out $message
+    }
+    list $out [::fakeserver::stats $id] [info commands ::db2]
+} -cleanup {
+    ::fakeserver::stop $id
+} -result {{{Frostlake has no read-only connections} {bad option "-nullvalue": must be -cacert, -connecttimeout, -database, -encoding, -idlelimit, -isolation, -readonly, -role, -schema, -timeout, -verify, or -warehouse} {ambiguous option "-c": must be -cacert, -connecttimeout, -database, -encoding, -idlelimit, -isolation, -readonly, -role, -schema, -timeout, -verify, or -warehouse}} {requests 0 connections 0} {}}
+
+test tdbc-1.6 {the native connect options pass through} -constraints tdbc -setup {
+    td::reset
+    set id [td::start -database MY_DB -schema S]
+} -body {
+    set td::seen
+} -cleanup {
+    td::stop $id
+} -result {{USE DATABASE "MY_DB"} {USE SCHEMA "S"}}
+
+test tdbc-1.7 {a server that cannot be reached is a connection exception} -constraints tdbc -body {
+    catch {::tdbc::frostlake::connection create ::db2 frostlake://127.0.0.1:1 -connecttimeout 2s} message options
+    list [lrange [dict get $options -errorcode] 0 4] [info commands ::db2]
+} -result {{TDBC CONNECTION_EXCEPTION 08001 FROSTLAKE CONNECTION} {}}
+
+# ------------------------------------------------------------------ binding
+
+test tdbc-2.1 {a variable missing from the dictionary is NULL} -constraints tdbc -setup {
+    td::reset
+    set id [td::start]
+} -body {
+    db allrows {SELECT :a, :b} {a 1}
+    set td::seen
+} -cleanup {
+    td::stop $id
+} -result {{SELECT '1', NULL}}
+
+test tdbc-2.2 {without a dictionary the caller's variables are read, a missing one NULL} -constraints tdbc -setup {
+    td::reset
+    set id [td::start]
+    proc td::caller {} {
+        set a 5
+        db allrows {SELECT :a, :z}
+        set stmt [db prepare {SELECT :a}]
+        $stmt allrows
+        $stmt foreach row {}
+        [$stmt execute] close
+        $stmt close
+    }
+} -body {
+    td::caller
+    set td::seen
+} -cleanup {
+    td::stop $id
+} -result {{SELECT '5', NULL} {SELECT '5'} {SELECT '5'} {SELECT '5'}}
+
+test tdbc-2.3 {an empty string is a string: only absence is NULL} -constraints tdbc -setup {
+    td::reset
+    set id [td::start]
+} -body {
+    db allrows {SELECT :a} {a {}}
+    set td::seen
+} -cleanup {
+    td::stop $id
+} -result {{SELECT ''}}
+
+test tdbc-2.4 {Snowflake syntax that looks like a variable reaches the engine as written} -constraints tdbc -setup {
+    td::reset
+    set id [td::start]
+} -body {
+    db allrows {SELECT $sv, v:f, x::INT, ':c', "q:d", ?, :1, $$ :e $$ FROM @st /* :g */} \
+        {sv 1 f 1 INT 1 c 1 d 1 e 1 st 1 g 1}
+    set td::seen
+} -cleanup {
+    td::stop $id
+} -result {{SELECT $sv, v:f, x::INT, ':c', "q:d", ?, :1, $$ :e $$ FROM @st /* :g */}}
+
+test tdbc-2.5 {a variable's name keeps the case it was written in} -constraints tdbc -setup {
+    td::reset
+    set id [td::start]
+} -body {
+    db allrows {SELECT :Id, :id} {Id 1 id 2 ID 3}
+    set td::seen
+} -cleanup {
+    td::stop $id
+} -result {{SELECT '1', '2'}}
+
+test tdbc-2.6 {quotes and backslashes in a value cannot break out of its literal} -constraints tdbc -setup {
+    td::reset
+    set id [td::start]
+} -body {
+    db allrows {SELECT :a} [list a "it's a \\ test"]
+    set td::seen
+} -cleanup {
+    td::stop $id
+} -result {{SELECT 'it''s a \\ test'}}
+
+test tdbc-2.7 {params lists each variable once, in order of first appearance} -constraints tdbc -setup {
+    td::reset
+    set id [td::start]
+} -body {
+    set stmt [db prepare {SELECT :b, :a, :b, ?}]
+    set out [$stmt params]
+    $stmt close
+    set out
+} -cleanup {
+    td::stop $id
+} -result {b {direction in type varchar precision 0 scale 0 nullable 1} a {direction in type varchar precision 0 scale 0 nullable 1}}
+
+test tdbc-2.8 {paramtype decides how a value is written} -constraints tdbc -setup {
+    td::reset
+    set id [td::start]
+} -body {
+    set stmt [db prepare {SELECT :i, :n, :d, :b, :t, :x, :s}]
+    $stmt paramtype i integer
+    $stmt paramtype n in decimal 10 2
+    $stmt paramtype d date
+    $stmt paramtype b bit
+    $stmt paramtype t timestamp
+    $stmt paramtype x varbinary
+    $stmt paramtype s varchar
+    $stmt allrows [dict create i -5 n 1.50 d 2024-01-15 b yes \
+                       t {2024-01-15 10:30:00} x [binary format H* AB01] s 007]
+    set out [list [lindex $td::seen end] [dict get [$stmt params] n]]
+    $stmt close
+    set out
+} -cleanup {
+    td::stop $id
+} -result {{SELECT (-5), 1.50, '2024-01-15'::DATE, TRUE, '2024-01-15 10:30:00'::TIMESTAMP_NTZ, X'AB01', '007'} {direction in type decimal precision 10 scale 2 nullable 1}}
+
+test tdbc-2.9 {paramtype refuses what it cannot honour, and a bad value is never sent} -constraints tdbc -setup {
+    td::reset
+    set id [td::start]
+} -body {
+    set stmt [db prepare {SELECT :a}]
+    set out {}
+    foreach call {{nope integer} {a varchar2} {a out integer} {a}} {
+        catch {$stmt paramtype {*}$call} message options
+        lappend out [lindex [dict get $options -errorcode] 1]
+    }
+    $stmt paramtype a integer
+    catch {$stmt allrows {a abc}} message options
+    lappend out [td::code $options] $message $td::seen
+    $stmt close
+    set out
+} -cleanup {
+    td::stop $id
+} -result {GENERAL_ERROR GENERAL_ERROR FEATURE_NOT_SUPPORTED GENERAL_ERROR {TDBC DATA_EXCEPTION 22018 FROSTLAKE} {a number bind needs a number, got "abc"} {}}
+
+test tdbc-2.10 {render shows what a statement would send, without sending it} -constraints tdbc -setup {
+    td::reset
+    set id [td::start]
+    unset -nocomplain a b
+} -body {
+    set stmt [db prepare {SELECT :a, :b}]
+    set a 1
+    set out [list [$stmt render {a x}] [$stmt render] $td::seen]
+    $stmt close
+    set out
+} -cleanup {
+    td::stop $id
+    unset -nocomplain a
+} -result {{SELECT 'x', NULL} {SELECT '1', NULL} {}}
+
+# ------------------------------------------------------------------ results
+
+test tdbc-3.1 {a NULL is an empty string in a list row, and an absent key in a dict row} -constraints tdbc -setup {
+    td::reset {dict create body [::fakeserver::ok [td::sets {A B C} {[[null,"","x"]]}]]}
+    set id [td::start]
+} -body {
+    list [db allrows -as lists {SELECT 1}] [db allrows -as dicts {SELECT 1}]
+} -cleanup {
+    td::stop $id
+} -result {{{{} {} x}} {{B {} C x}}}
+
+test tdbc-3.2 {a DML statement answers no columns, no rows, and a rowcount} -constraints tdbc -setup {
+    td::reset {dict create body [::fakeserver::ok {[{"columns":[
+        {"dataType":"NUMBER","name":"number of rows updated"},
+        {"dataType":"NUMBER","name":"number of multi-joined rows updated"}],
+        "rows":[[4,0]]}]}]}
+    set id [td::start]
+} -body {
+    set stmt [db prepare {UPDATE t SET a = 1}]
+    set rs [$stmt execute]
+    set out [list [$rs columns] [$rs rowcount] [$rs nextlist row]]
+    $stmt close
+    lappend out [db allrows {UPDATE t SET a = 1}]
+} -cleanup {
+    td::stop $id
+} -result {{} 4 0 {}}
+
+test tdbc-3.3 {a query's rowcount is -1, and its columns come in order} -constraints tdbc -setup {
+    td::reset {dict create body [::fakeserver::ok [td::sets {B A} {[[1,2],[3,4]]}]]}
+    set id [td::start]
+} -body {
+    set stmt [db prepare {SELECT b, a FROM t}]
+    set rs [$stmt execute]
+    set out [list [$rs columns] [$rs rowcount]]
+    while {[$rs nextrow -as lists row]} { lappend out $row }
+    $stmt close
+    set out
+} -cleanup {
+    td::stop $id
+} -result {{B A} -1 {1 2} {3 4}}
+
+test tdbc-3.4 {several result sets are walked with nextresults, and not past the end} -constraints tdbc -setup {
+    td::reset {dict create body [::fakeserver::ok [td::sets {A} {[[1]]} {B} {[[2],[3]]}]]}
+    set id [td::start]
+} -body {
+    set stmt [db prepare {SELECT 1; SELECT 2}]
+    set rs [$stmt execute]
+    set out [list [$rs columns]]
+    $rs nextlist row
+    lappend out $row [$rs nextresults] [$rs columns] [$rs allrows -as lists] \
+        [$rs nextresults]
+    catch {$rs columns} message options
+    lappend out [td::code $options]
+    $stmt close
+    set out
+} -cleanup {
+    td::stop $id
+} -result {A 1 1 B {2 3} 0 {TDBC GENERAL_ERROR HY010 FROSTLAKE}}
+
+test tdbc-3.5 {foreach, with -columnsvariable, across every result set} -constraints tdbc -setup {
+    td::reset {dict create body [::fakeserver::ok [td::sets {A} {[[1],[2]]} {B} {[[3]]}]]}
+    set id [td::start]
+} -body {
+    set out {}
+    db foreach -columnsvariable cols row {SELECT 1; SELECT 2} {
+        lappend out $cols $row
+    }
+    set out
+} -cleanup {
+    td::stop $id
+    unset -nocomplain out cols row
+} -result {A {A 1} A {A 2} B {B 3}}
+
+# ------------------------------------------------------------------- errors
+
+test tdbc-4.1 {a refused statement keeps the engine's wording, and its statement in the detail} -constraints tdbc -setup {
+    td::reset {dict create status 500 body [::fakeserver::failed \
+        "SQL compilation error:\nObject 'T' does not exist or not authorized."]}
+    set id [td::start]
+} -body {
+    catch {db allrows {SELECT * FROM t WHERE a = :a} {a 1}} message options
+    set code [dict get $options -errorcode]
+    list [::helper::flatten $message] [lrange $code 0 4] \
+         [dict get [lindex $code 5] statement]
+} -cleanup {
+    td::stop $id
+} -result {{SQL compilation error: Object 'T' does not exist or not authorized.} {TDBC GENERAL_ERROR HY000 FROSTLAKE QUERY} {SELECT * FROM t WHERE a = '1'}}
+
+test tdbc-4.2 {a server that dies mid-answer is a connection exception} -constraints tdbc -setup {
+    td::reset {dict create raw "HTTP/1.1 200 OK\r\nContent-Length: 400\r\n\r\nshort"}
+    set id [td::start]
+} -body {
+    catch {db allrows {SELECT 1}} message options
+    lrange [dict get $options -errorcode] 0 4
+} -cleanup {
+    td::stop $id
+} -result {TDBC CONNECTION_EXCEPTION 08006 FROSTLAKE CONNECTION}
+
+# ------------------------------------------------------------- transactions
+
+test tdbc-5.1 {transaction commits a script that finishes, rolls back one that fails} -constraints tdbc -setup {
+    td::reset
+    set id [td::start]
+} -body {
+    db transaction { db allrows {INSERT INTO t VALUES (1)} }
+    catch {
+        db transaction {
+            db allrows {INSERT INTO t VALUES (2)}
+            error "changed my mind"
+        }
+    } message
+    list $td::seen $message
+} -cleanup {
+    td::stop $id
+} -result {{BEGIN {INSERT INTO t VALUES (1)} COMMIT BEGIN {INSERT INTO t VALUES (2)} ROLLBACK} {changed my mind}}
+
+test tdbc-5.2 {break, continue and return in a transaction act on the caller, after the commit} -constraints tdbc -setup {
+    td::reset
+    set id [td::start]
+    proc td::early {} {
+        db transaction { return early }
+        return late
+    }
+} -body {
+    set out {}
+    foreach x {1 2 3 4} {
+        db transaction {
+            if {$x == 2} continue
+            if {$x == 3} break
+        }
+        lappend out $x
+    }
+    list $out [td::early] [llength [lsearch -all $td::seen COMMIT]] \
+         [lsearch $td::seen ROLLBACK]
+} -cleanup {
+    td::stop $id
+    unset -nocomplain out x
+} -result {1 early 4 -1}
+
+test tdbc-5.3 {a second begintransaction is refused: Frostlake does not nest them} -constraints tdbc -setup {
+    td::reset
+    set id [td::start]
+} -body {
+    db begintransaction
+    catch {db begintransaction} message options
+    db rollback
+    list [td::code $options] $td::seen
+} -cleanup {
+    td::stop $id
+} -result {{TDBC INVALID_TRANSACTION_STATE 25001 FROSTLAKE} {BEGIN ROLLBACK}}
+
+test tdbc-5.4 {closing a connection rolls back what it left open} -constraints tdbc -setup {
+    td::reset
+    set id [td::start]
+} -body {
+    db begintransaction
+    db close
+    set td::seen
+} -cleanup {
+    td::stop $id
+} -result {BEGIN ROLLBACK}
+
+# --------------------------------------------------------------- preparecall
+
+test tdbc-6.1 {preparecall is a CALL, and its result variable an output parameter} -constraints tdbc -setup {
+    td::reset {dict create body [::fakeserver::ok \
+        {[{"columns":[{"dataType":"NUMBER","name":"MYPROC"}],"rows":[[42]]}]}]}
+    set id [td::start]
+} -body {
+    set stmt [db preparecall {total = myproc(:a, 'x')}]
+    set rs [$stmt execute {a 2}]
+    set out [list [dict keys [$stmt params]] \
+                  [dict get [$stmt params] total direction] \
+                  [$rs outputparams] $td::seen]
+    $stmt close
+    set out
+} -cleanup {
+    td::stop $id
+} -result {{total a} out {total 42} {{CALL myproc('2', 'x')}}}
+
+test tdbc-6.2 {a call without a result variable, and text that is not a call} -constraints tdbc -setup {
+    td::reset
+    set id [td::start]
+} -body {
+    set stmt [db preparecall {myproc()}]
+    set rs [$stmt execute]
+    set out [list [$rs outputparams]]
+    $stmt close
+    catch {db preparecall {SELECT 1}} message options
+    lappend out [td::code $options] $td::seen
+} -cleanup {
+    td::stop $id
+} -result {{} {TDBC SYNTAX_ERROR_OR_ACCESS_RULE_VIOLATION 42000 FROSTLAKE} {{CALL myproc()}}}
+
+# --------------------------------------------------------------- bookkeeping
+
+test tdbc-7.1 {the connection keeps track of its statements and result sets} -constraints tdbc -setup {
+    td::reset
+    set id [td::start]
+} -body {
+    set first [db prepare {SELECT 1}]
+    set second [db prepare {SELECT 2}]
+    set rs [$first execute]
+    set out [list [llength [db statements]] [llength [db resultsets]]]
+    $first close
+    lappend out [expr {[db statements] eq [list $second]}] \
+                [expr {[info commands $rs] eq ""}]
+} -cleanup {
+    td::stop $id
+} -result {2 1 1 1}
+
+test tdbc-7.2 {closing the connection closes its statements and the native connection} -constraints tdbc -setup {
+    td::reset
+    set id [td::start]
+} -body {
+    set stmt [db prepare {SELECT 1}]
+    set native [db getDBhandle]
+    db close
+    list [info commands $stmt] [info commands $native]
+} -cleanup {
+    td::stop $id
+} -result {{} {}}
+
+# --------------------------------------------------------- against an engine
+
+namespace eval te {
+    variable db ""
+
+    # One TDBC connection for this half, in a database of its own.
+    proc db {} {
+        variable db
+        if {$db eq ""} {
+            set db [::tdbc::frostlake::connection new \
+                        [dict get [::testserver::shared] dsn]]
+            foreach sql {
+                {CREATE OR REPLACE DATABASE tdbc_test_db}
+                {USE DATABASE tdbc_test_db}
+                {CREATE OR REPLACE SCHEMA tdbc_test_schema}
+                {USE SCHEMA tdbc_test_schema}
+                {CREATE TABLE people (id INTEGER NOT NULL PRIMARY KEY,
+                                      name VARCHAR(20), score NUMBER(10,2))}
+                {CREATE TABLE pets (pid INTEGER, owner INTEGER,
+                    CONSTRAINT fk_owner FOREIGN KEY (owner) REFERENCES people (id))}
+                {CREATE TABLE "mixed" (x INTEGER)}
+                {CREATE VIEW vw AS SELECT id FROM people}
+            } {
+                $db allrows $sql
+            }
+        }
+        return $db
+    }
+}
+
+test tdbc-10.1 {a round trip, with a missing variable stored as NULL} -constraints tdbcengine -body {
+    set db [te::db]
+    $db allrows {INSERT INTO people VALUES (:id, :name, :score)} {id 1 name Ada score 99.5}
+    $db allrows {INSERT INTO people VALUES (:id, :name, :score)} {id 2}
+    list [$db allrows {SELECT id, name, score FROM people ORDER BY id}] \
+         [$db allrows -as lists {SELECT id, name, score FROM people ORDER BY id}]
+} -result {{{ID 1 NAME Ada SCORE 99.50} {ID 2}} {{1 Ada 99.50} {2 {} {}}}}
+
+test tdbc-10.2 {the caller's variables, and a numeric type where SQL needs a numeral} -constraints tdbcengine -setup {
+    proc te::first {n} {
+        set stmt [[te::db] prepare {SELECT id FROM people ORDER BY id LIMIT :n}]
+        $stmt paramtype n integer
+        set rows [$stmt allrows -as lists]
+        $stmt close
+        return $rows
+    }
+} -body {
+    te::first 1
+} -result 1
+
+test tdbc-10.3 {DML answers its rowcount and no rows} -constraints tdbcengine -body {
+    set db [te::db]
+    set stmt [$db prepare {UPDATE people SET score = :s}]
+    set rs [$stmt execute {s 1}]
+    set out [list [$rs rowcount] [$rs columns]]
+    $stmt close
+    lappend out [$db allrows {UPDATE people SET score = 2}]
+} -result {2 {} {}}
+
+test tdbc-10.4 {a session variable reaches the engine as written} -constraints tdbcengine -body {
+    set db [te::db]
+    $db allrows {SET sv = 'kept'}
+    $db allrows {SELECT $sv AS v} {sv {not this}}
+} -result {{V kept}}
+
+test tdbc-10.5 {a transaction keeps its rows, and a failed one keeps none} -constraints tdbcengine -body {
+    set db [te::db]
+    $db transaction { $db allrows {INSERT INTO people (id) VALUES (3)} }
+    catch {
+        $db transaction {
+            $db allrows {INSERT INTO people (id) VALUES (4)}
+            error "changed my mind"
+        }
+    }
+    $db allrows -as lists {SELECT id FROM people ORDER BY id}
+} -result {1 2 3}
+
+test tdbc-10.6 {a refused statement carries TDBC's code and the engine's wording} -constraints tdbcengine -body {
+    catch {[te::db] allrows {SELECT * FROM no_such_table}} message options
+    list [lrange [dict get $options -errorcode] 0 4] [::helper::flatten $message]
+} -result {{TDBC GENERAL_ERROR HY000 FROSTLAKE QUERY} {SQL compilation error: Object 'NO_SUCH_TABLE' does not exist or not authorized.}}
+
+test tdbc-10.7 {tables and columns of the current schema, found the way the engine resolves a name} -constraints tdbcengine -body {
+    set db [te::db]
+    list [dict keys [$db tables]] [dict keys [$db tables p%]] \
+         [dict get [$db tables vw] VW tableType] \
+         [dict get [$db columns people] ID] [dict get [$db columns people] NAME] \
+         [dict keys [$db columns people s%]] [dict keys [$db columns mixed]] \
+         [$db columns no_such_table]
+} -result {{PEOPLE PETS VW mixed} {PEOPLE PETS} VIEW {name ID type decimal precision 38 scale 0 nullable 0 datatype NUMBER} {name NAME type varchar precision 20 scale 0 nullable 1 datatype TEXT} SCORE X {}}
+
+test tdbc-10.8 {primary and foreign keys, from either end} -constraints tdbcengine -body {
+    set db [te::db]
+    set pk [lindex [$db primarykeys people] 0]
+    set fk [lindex [$db foreignkeys -foreign pets] 0]
+    list [dict get $pk tableName] [dict get $pk columnName] [dict get $pk ordinalPosition] \
+         [dict get $fk foreignConstraintName] [dict get $fk foreignTable] \
+         [dict get $fk foreignColumn] [dict get $fk primaryTable] \
+         [dict get $fk primaryColumn] [dict get $fk deleteAction] \
+         [llength [$db foreignkeys -primary people]] \
+         [llength [$db foreignkeys -primary pets]] [llength [$db foreignkeys]]
+} -result {PEOPLE ID 1 FK_OWNER PETS OWNER PEOPLE ID {NO ACTION} 1 0 1}
+
+test tdbc-10.9 {preparecall runs a procedure and answers its result} -constraints tdbcengine -body {
+    set db [te::db]
+    $db allrows {CREATE OR REPLACE PROCEDURE add_one(n INTEGER) RETURNS INTEGER
+                 LANGUAGE SQL AS $$ BEGIN RETURN n + 1; END $$}
+    set stmt [$db preparecall {res = add_one(:n)}]
+    $stmt paramtype n integer
+    set out [[$stmt execute {n 41}] outputparams]
+    $stmt close
+    set out
+} -result {res 42}
+
+test tdbc-10.10 {typed parameters round trip through typed columns} -constraints tdbcengine -body {
+    set db [te::db]
+    $db allrows {CREATE TABLE typed (d DATE, b BOOLEAN, x BINARY, t TIMESTAMP_NTZ)}
+    set stmt [$db prepare {INSERT INTO typed VALUES (:d, :b, :x, :t)}]
+    $stmt paramtype d date
+    $stmt paramtype b bit
+    $stmt paramtype x varbinary
+    $stmt paramtype t timestamp
+    $stmt allrows [dict create d 2024-01-15 b 1 x [binary format H* AB01] \
+                       t {2024-01-15 10:30:00}]
+    $stmt close
+    $db allrows -as lists {SELECT d, b, x, t FROM typed}
+} -result {{2024-01-15 true AB01 {2024-01-15 10:30:00.000}}}
+
+# The engine itself is released by all.tcl once every file has run.
+if {$te::db ne ""} {
+    catch {$te::db allrows {DROP DATABASE IF EXISTS tdbc_test_db}}
+    catch {$te::db close}
+    set te::db ""
+}
+
+cleanupTests

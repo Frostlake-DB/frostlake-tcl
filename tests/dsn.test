@@ -1,0 +1,139 @@
+# DSN parsing: what a connection string means, and what it refuses to guess.
+
+source [file join [file dirname [info script]] helper.tcl]
+namespace import -force ::tcltest::*
+
+proc dsnfield {text field} {
+    return [dict get [::frostlake::dsn parse $text] $field]
+}
+
+test dsn-1.1 {host and the engine's default port} -body {
+    lmap f {host port secure} {dsnfield frostlake://localhost $f}
+} -result {localhost 18082 0}
+
+test dsn-1.2 {an explicit port wins} -body {
+    lmap f {host port} {dsnfield frostlake://db.example.com:9000 $f}
+} -result {db.example.com 9000}
+
+test dsn-1.3 {http and https keep their own default ports} -body {
+    list [dsnfield http://h port] [dsnfield https://h port] [dsnfield https://h secure]
+} -result {80 443 1}
+
+test dsn-1.4 {tls=true upgrades a frostlake:// DSN} -body {
+    list [dsnfield frostlake://h?tls=true secure] [dsnfield frostlake://h?tls=no secure]
+} -result {1 0}
+
+test dsn-1.5 {an IPv6 literal, with and without a port} -body {
+    list [dsnfield {frostlake://[::1]} host] [dsnfield {frostlake://[::1]} port] \
+         [dsnfield {frostlake://[2001:db8::1]:9} host] [dsnfield {frostlake://[2001:db8::1]:9} port]
+} -result {::1 18082 2001:db8::1 9}
+
+test dsn-2.1 {the path names the database} -body {
+    dsnfield frostlake://h/MY_DB database
+} -result MY_DB
+
+test dsn-2.2 {no path means no database} -body {
+    list [dsnfield frostlake://h database] [dsnfield frostlake://h/ database]
+} -result {{} {}}
+
+test dsn-2.3 {a percent-escaped database name is decoded} -body {
+    dsnfield {frostlake://h/my%20db} database
+} -result {my db}
+
+test dsn-2.4 {a multi-byte percent escape decodes as UTF-8} -body {
+    dsnfield {frostlake://h/caf%C3%A9} database
+} -result "café"
+
+test dsn-2.5 {two path segments name no single database} -body {
+    catch {::frostlake::dsn parse frostlake://h/a/b} message
+    set message
+} -result {the DSN path names one database, got "/a/b"}
+
+test dsn-3.1 {scope parameters} -body {
+    lmap f {schema role warehouse} {
+        dsnfield {frostlake://h/D?schema=S&role=R&warehouse=W} $f
+    }
+} -result {S R W}
+
+test dsn-3.2 {durations, in every spelling, as milliseconds} -body {
+    list [dsnfield frostlake://h?timeout=30 timeout] \
+         [dsnfield frostlake://h?timeout=500ms timeout] \
+         [dsnfield frostlake://h?timeout=5m timeout] \
+         [dsnfield frostlake://h?timeout=1h timeout] \
+         [dsnfield frostlake://h?timeout=1.5s timeout] \
+         [dsnfield frostlake://h?timeout=0 timeout]
+} -result {30000 500 300000 3600000 1500 0}
+
+test dsn-3.3 {the defaults} -body {
+    lmap f {connectTimeout timeout idleLimit} {dsnfield frostlake://h $f}
+} -result {10000 300000 1800000}
+
+test dsn-3.4 {a leading zero is decimal, never octal} -body {
+    lmap text {010ms 08 09s 00.5s} { ::frostlake::dsn duration timeout $text }
+} -result {10 8000 9000 500}
+
+test dsn-4.1 {USE statements come out in dependency order, quoted} -body {
+    ::frostlake::dsn usestatements \
+        [::frostlake::dsn parse {frostlake://h/D?schema=S&role=R&warehouse=W}]
+} -result {{USE ROLE "R"} {USE WAREHOUSE "W"} {USE DATABASE "D"} {USE SCHEMA "S"}}
+
+test dsn-4.2 {only what the DSN named} -body {
+    ::frostlake::dsn usestatements [::frostlake::dsn parse frostlake://h/D]
+} -result {{USE DATABASE "D"}}
+
+test dsn-4.3 {an embedded quote cannot break out of an identifier} -body {
+    ::frostlake::dsn quote {a"b}
+} -result {"a""b"}
+
+test dsn-4.4 {baseurl} -body {
+    list [::frostlake::dsn baseurl [::frostlake::dsn parse frostlake://h:1]] \
+         [::frostlake::dsn baseurl [::frostlake::dsn parse https://h]]
+} -result {http://h:1 https://h:443}
+
+test dsn-5.1 {a scheme that is not ours} -body {
+    catch {::frostlake::dsn parse postgres://h} message
+    set message
+} -result {a DSN must start with frostlake://, http:// or https://}
+
+test dsn-5.2 {no scheme at all} -body {
+    catch {::frostlake::dsn parse localhost:18082} message
+    set message
+} -result {a DSN must start with frostlake://, http:// or https://}
+
+test dsn-5.3 {credentials are refused rather than silently dropped} -body {
+    catch {::frostlake::dsn parse frostlake://user:pw@h} message
+    set message
+} -result {the server takes no credentials; remove user:password from the DSN}
+
+test dsn-5.4 {an unknown parameter is a typo, not an extension} -body {
+    catch {::frostlake::dsn parse frostlake://h?schemaa=S} message
+    set message
+} -match glob -result {unknown DSN parameter: schemaa (expected connectTimeout, *)}
+
+test dsn-5.5 {a port that is not a number, or not a port} -body {
+    list [catch {::frostlake::dsn parse frostlake://h:abc}] \
+         [catch {::frostlake::dsn parse frostlake://h:0}] \
+         [catch {::frostlake::dsn parse frostlake://h:70000}]
+} -result {1 1 1}
+
+test dsn-5.6 {an empty scope parameter says so} -body {
+    catch {::frostlake::dsn parse frostlake://h?schema=} message
+    set message
+} -result {the DSN parameter schema cannot be empty}
+
+test dsn-5.7 {a duration that is not one} -body {
+    catch {::frostlake::dsn parse frostlake://h?timeout=soon} message
+    set message
+} -result {timeout must be a duration such as 30s, 500ms or 5m, got "soon"}
+
+test dsn-5.8 {a missing host} -body {
+    list [catch {::frostlake::dsn parse frostlake:///DB}] \
+         [catch {::frostlake::dsn parse {frostlake://[::1}]}]
+} -result {1 1}
+
+test dsn-5.9 {every failure carries the usage code} -body {
+    catch {::frostlake::dsn parse nope://h} message options
+    lrange [dict get $options -errorcode] 0 1
+} -result {FROSTLAKE USAGE}
+
+cleanupTests

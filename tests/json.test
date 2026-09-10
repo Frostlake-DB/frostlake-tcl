@@ -1,0 +1,118 @@
+# The JSON reader: types kept, digits kept, malformed text refused.
+
+source [file join [file dirname [info script]] helper.tcl]
+namespace import -force ::tcltest::*
+
+namespace eval json-test {
+    namespace path ::frostlake
+}
+
+test json-1.1 {scalars keep their JSON type} -body {
+    lmap text {null true false 42 1.5 {"hi"}} {
+        ::frostlake::json type [::frostlake::json parse $text]
+    }
+} -result {null bool bool number number string}
+
+test json-1.2 {a number keeps every digit it arrived with} -body {
+    ::frostlake::json value [::frostlake::json parse 12345678901234567890123456789]
+} -result 12345678901234567890123456789
+
+test json-1.3 {and Tcl can still do exact arithmetic on it} -body {
+    expr {[::frostlake::json value [::frostlake::json parse 99999999999999999999]] + 1}
+} -result 100000000000000000000
+
+test json-1.4 {a fraction is not normalised away} -body {
+    lmap text {1.500 1e3 -0.0 0} {
+        ::frostlake::json value [::frostlake::json parse $text]
+    }
+} -result {1.500 1e3 -0.0 0}
+
+test json-2.1 {string escapes} -body {
+    ::frostlake::json value [::frostlake::json parse {"a\"b\\c\/d\te\nfA"}]
+} -result "a\"b\\c/d\te\nfA"
+
+test json-2.2 {a surrogate pair becomes one character} -body {
+    set text [::frostlake::json value [::frostlake::json parse {"😀"}]]
+    list [string length $text] [scan $text %c]
+} -result {2 128512}
+
+test json-2.3 {raw UTF-8 passes through} -body {
+    ::frostlake::json value [::frostlake::json parse "\"café 日本\""]
+} -result "café 日本"
+
+test json-3.1 {objects keep their key order} -body {
+    ::frostlake::json keys [::frostlake::json parse {{"z":1,"a":2,"m":3}}]
+} -result {z a m}
+
+test json-3.2 {a missing key reads as null, and `exists` tells them apart} -body {
+    set doc [::frostlake::json parse {{"present":null}}]
+    list [::frostlake::json type [::frostlake::json at $doc present]] \
+         [::frostlake::json exists $doc present] \
+         [::frostlake::json type [::frostlake::json at $doc absent]] \
+         [::frostlake::json exists $doc absent]
+} -result {null 1 null 0}
+
+test json-3.3 {arrays index and size} -body {
+    set doc [::frostlake::json parse {[10,"x",true,null]}]
+    list [::frostlake::json size $doc] \
+         [::frostlake::json scalar [::frostlake::json index $doc 1]] \
+         [::frostlake::json type [::frostlake::json index $doc 9]]
+} -result {4 x null}
+
+test json-3.4 {nesting} -body {
+    set doc [::frostlake::json parse {{"a":{"b":[1,{"c":"deep"}]}}}]
+    ::frostlake::json value [::frostlake::json at \
+        [::frostlake::json index [::frostlake::json at [::frostlake::json at $doc a] b] 1] c]
+} -result deep
+
+test json-3.5 {empty containers} -body {
+    list [::frostlake::json size [::frostlake::json parse {[]}]] \
+         [::frostlake::json size [::frostlake::json parse "{}"]] \
+         [::frostlake::json type [::frostlake::json parse {[]}]] \
+         [::frostlake::json type [::frostlake::json parse "{}"]]
+} -result {0 0 array object}
+
+test json-4.1 {scalar renders booleans as words Tcl accepts} -body {
+    set doc [::frostlake::json parse {[true,false,null]}]
+    list [::frostlake::json scalar [::frostlake::json index $doc 0]] \
+         [::frostlake::json scalar [::frostlake::json index $doc 1]] \
+         [::frostlake::json scalar [::frostlake::json index $doc 2] NUL] \
+         [expr {[::frostlake::json scalar [::frostlake::json index $doc 0]] ? "yes" : "no"}]
+} -result {true false NUL yes}
+
+test json-5.1 {round trip} -body {
+    set text {{"a":1,"b":[true,null,"x"],"c":{"d":1.50}}}
+    ::frostlake::json text [::frostlake::json parse $text]
+} -result {{"a":1,"b":[true,null,"x"],"c":{"d":1.50}}}
+
+test json-5.2 {encode_string escapes what JSON forbids raw} -body {
+    ::frostlake::json encode_string "a\"b\\c\td\ne\rf[format %c 8]"
+} -result {"a\"b\\c\td\ne\rf\b"}
+
+test json-5.3 {control characters below space get a \u form} -body {
+    ::frostlake::json encode_string [format %c 1]
+} -result [format {"%c%s"} 92 u0001]
+
+test json-5.4 {encode builds an object of strings} -body {
+    ::frostlake::json encode [dict create sql {SELECT 'a'} sessionId abc]
+} -result {{"sql":"SELECT 'a'","sessionId":"abc"}}
+
+test json-6.1 {malformed text is refused, not guessed at} -body {
+    set refused {}
+    foreach text {{} {[1,} {tru} {"unclosed} {{"a"}} {1 2} {[1 2]} {nul} {01} {+1} {'x'} {[,]}} {
+        lappend refused [catch {::frostlake::json parse $text}]
+    }
+    set refused
+} -result {1 1 1 1 1 1 1 1 1 1 1 1}
+
+test json-6.2 {the failure names an offset and carries a FROSTLAKE code} -body {
+    catch {::frostlake::json parse {{"a":1,"b":oops}}} message options
+    list [string match {invalid JSON at offset 11:*} $message] \
+         [lrange [dict get $options -errorcode] 0 1]
+} -result {1 {FROSTLAKE JSON}}
+
+test json-6.3 {a bad escape is refused} -body {
+    list [catch {::frostlake::json parse {"\q"}}] [catch {::frostlake::json parse {"\u12"}}]
+} -result {1 1}
+
+cleanupTests
