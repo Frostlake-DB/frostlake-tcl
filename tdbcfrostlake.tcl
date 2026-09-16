@@ -35,9 +35,9 @@
 
 package require Tcl 8.6
 package require tdbc 1.0
-package require frostlake 0.1.0
+package require frostlake 0.2.0
 
-package provide tdbc::frostlake 0.1.0
+package provide tdbc::frostlake 0.2.0
 
 namespace eval ::tdbc::frostlake {
     namespace export connection

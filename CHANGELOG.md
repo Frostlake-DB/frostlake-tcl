@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0
+
+- The package files moved from `lib/` to the top of the repository, so the
+  directory is itself a package directory: dropping it into any directory on
+  `auto_path` is enough, where before `lib/` had to be named. A script that
+  named `.../frostlake-tcl/lib` must now name `.../frostlake-tcl`.
+
 ## 0.1.0
 
 First release.

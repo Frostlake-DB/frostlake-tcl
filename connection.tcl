@@ -188,16 +188,29 @@ oo::class create ::frostlake::Connection {
     # take a list, `:name` markers take a dict. In Tcl those are the same value,
     # so letting the statement decide is the only reading that cannot be
     # ambiguous.
+    #
+    # `-multistatementcount` says how many statements this one request carries;
+    # see `executeall`.
     method execute {sql args} {
         return [lindex [my executeall $sql {*}$args] 0]
     }
 
     # Runs a statement string and returns every result set it produced, in
     # order. A single statement gives a one-element list.
+    #
+    # The engine refuses a request holding more statements than it was told to
+    # expect, so a pack says how many it holds:
+    #
+    #     $conn executeall {SELECT 1; SELECT 2} -multistatementcount 2
+    #
+    # The count travels with this one request. It outranks the session's
+    # MULTI_STATEMENT_COUNT without changing it, so there is nothing to put back
+    # afterwards, and 0 allows any number. Left out, no count is sent at all and
+    # the session's value decides.
     method executeall {sql args} {
-        lassign [my ParseArguments $args] params types
+        lassign [my ParseArguments $args] params types count
         set rendered [my Render $sql $params $types]
-        return [my Run $sql $rendered]
+        return [my Run $sql $rendered $count]
     }
 
     # Renders a statement with its parameters inlined, without sending it.
@@ -206,7 +219,7 @@ oo::class create ::frostlake::Connection {
     # WARNING: the result holds bound values verbatim -- a password bound into
     # a statement appears in it in the clear.
     method render {sql args} {
-        lassign [my ParseArguments $args] params types
+        lassign [my ParseArguments $args -types] params types
         return [my Render $sql $params $types]
     }
 
@@ -225,12 +238,17 @@ oo::class create ::frostlake::Connection {
         return [::frostlake::bind::positional $sql $params $types $nullvalue]
     }
 
-    # `sql ?params? ?-types list?`. Parameters come first; an argument starting
-    # with a dash is read as an option, so a parameter list whose first element
-    # begins with one is introduced by `--`.
-    method ParseArguments {argv} {
+    # `sql ?params? ?-types list? ?-multistatementcount n?`. Parameters come
+    # first; an argument starting with a dash is read as an option, so a
+    # parameter list whose first element begins with one is introduced by `--`.
+    #
+    # `accepted` is what the caller is allowed to name: `render` binds and
+    # returns, so a count it could not act on is refused there rather than
+    # quietly ignored.
+    method ParseArguments {argv {accepted {-types -multistatementcount}}} {
         set params {}
         set types {}
+        set count ""
         if {[llength $argv]} {
             if {[lindex $argv 0] eq "--"} {
                 set params [lindex $argv 1]
@@ -244,25 +262,40 @@ oo::class create ::frostlake::Connection {
             ::frostlake::UsageError "option \"[lindex $argv end]\" has no value"
         }
         foreach {option value} $argv {
+            if {[lsearch -exact $accepted $option] < 0} {
+                ::frostlake::UsageError "unknown option \"$option\" (expected\
+                    [join $accepted {, }])"
+            }
             switch -exact -- $option {
                 -types { set types $value }
-                default {
-                    ::frostlake::UsageError \
-                        "unknown option \"$option\" (expected -types)"
-                }
+                -multistatementcount { set count [my StatementCount $value] }
             }
         }
-        return [list $params $types]
+        return [list $params $types $count]
+    }
+
+    # The statement count an option declares, checked here so a bad value is a
+    # usage error rather than a request body the engine cannot read.
+    method StatementCount {value} {
+        # Spelled the way JSON spells an integer: `string is entier` would let
+        # 0x10 and 1e2 through, and neither is a number this body can carry.
+        if {![regexp {^(?:0|[1-9][0-9]*)$} $value]} {
+            ::frostlake::UsageError "-multistatementcount takes a whole number of\
+                statements, 0 for any number, got \"$value\""
+        }
+        return $value
     }
 
     # The pending USE statements and the statement itself reach the session as
     # one unit: no other caller may slip a query in between them.
-    method Run {sql rendered} {
+    method Run {sql rendered {multistatementcount ""}} {
         my Enter
         try {
             my RestoreSessionDefaults
+            # The pending USE statements are one statement each, whatever this
+            # request declares, so the count goes only on the caller's own.
             my DrainPendingUse
-            set answer [my RoundTrip $rendered]
+            set answer [my RoundTrip $rendered $multistatementcount]
             if {[::frostlake::sql::changesscope $sql]} { set sessionTouched 1 }
             return [my Shape $answer]
         } finally {
@@ -427,13 +460,20 @@ oo::class create ::frostlake::Connection {
         return
     }
 
-    method RoundTrip {sql} {
+    method RoundTrip {sql {multistatementcount ""}} {
         set endpoint "[my baseurl]/api/execute"
         set payload "\{\"sql\":[::frostlake::json::encode_string $sql]"
         if {$sessionid ne ""} {
             append payload ",\"sessionId\":[::frostlake::json::encode_string $sessionid]"
         }
-        append payload ",\"autoCommit\":[expr {$autocommit ? {true} : {false}}]\}"
+        append payload ",\"autoCommit\":[expr {$autocommit ? {true} : {false}}]"
+        # Absent unless the caller asked for a count: a request without the
+        # field is the one the server has always seen, and the session's value
+        # decides.
+        if {$multistatementcount ne ""} {
+            append payload ",\"multiStatementCount\":$multistatementcount"
+        }
+        append payload "\}"
 
         set answer [my Send POST /api/execute $payload]
         set decoded [my Decode $endpoint $answer]
@@ -555,12 +595,17 @@ oo::class create ::frostlake::Connection {
         if {[::frostlake::json::type $raw] eq "array"} {
             foreach column [::frostlake::json::value $raw] {
                 if {[::frostlake::json::type $column] ne "object"} { continue }
+                # `length` is the declared width of a text or binary column:
+                # characters for VARCHAR, bytes for BINARY. Every other type
+                # sends none, and so does an engine that predates the field --
+                # "" either way, the same as an unsent precision.
                 lappend columns [dict create \
                     name      [my Text $column name] \
                     datatype  [my Text $column dataType] \
                     nullable  [my Flag $column nullable] \
                     precision [my Number $column precision] \
-                    scale     [my Number $column scale]]
+                    scale     [my Number $column scale] \
+                    length    [my Number $column length]]
             }
         }
 

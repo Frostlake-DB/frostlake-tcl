@@ -7,6 +7,7 @@ namespace import -force ::tcltest::*
 
 namespace eval tt {
     variable seen {}
+    variable bodies {}
     variable reply {}
     variable healthbody {}
 
@@ -14,6 +15,7 @@ namespace eval tt {
     # evaluated per statement.
     proc handler {method path headers body} {
         variable seen
+        variable bodies
         variable reply
         variable healthbody
         if {$path eq "/api/health"} {
@@ -24,6 +26,9 @@ namespace eval tt {
         set sql [::frostlake::json value [::frostlake::json at $decoded sql]]
         set session [::frostlake::json at $decoded sessionId]
         lappend seen $sql
+        # The whole request too, for the cases about what went out rather than
+        # about what came back.
+        lappend bodies $decoded
         return [uplevel #0 [list apply {{sql session} {
             eval $::tt::reply
         }} $sql $session]]
@@ -31,8 +36,21 @@ namespace eval tt {
 
     proc reset {answer {health {}}} {
         variable seen {}
+        variable bodies {}
         variable reply $answer
         variable healthbody $health
+    }
+
+    # One field of the last /api/execute request, or "missing" when the request
+    # did not carry it at all.
+    proc field {key} {
+        variable bodies
+        set body [lindex $bodies end]
+        # `at` answers JSON null for a key that is not there, so absence is
+        # asked about directly -- the difference between "left out" and "sent as
+        # null" is the whole point of these cases.
+        if {![::frostlake::json exists $body $key]} { return missing }
+        return [::frostlake::json value [::frostlake::json at $body $key]]
     }
 }
 
@@ -414,7 +432,32 @@ test transport-4.6 {column metadata the server omitted is empty, not invented} -
     } finally {
         ::fakeserver::stop $id
     }
-} -result {name V datatype VARCHAR nullable {} precision {} scale {}}
+} -result {name V datatype VARCHAR nullable {} precision {} scale {} length {}}
+
+test transport-4.7 {a text or binary column carries its declared width} -body {
+    # The wire sends `length` for VARCHAR and BINARY only -- characters for one,
+    # bytes for the other -- and an unbounded column carries the most it could
+    # hold, so nothing has to be guessed. Every other type has no width.
+    tt::reset {dict create body [::fakeserver::ok {[{"columns":[
+        {"dataType":"VARCHAR","name":"V9","precision":0,"scale":0,"length":9},
+        {"dataType":"BINARY","name":"B5","precision":0,"scale":0,"length":5},
+        {"dataType":"NUMBER","name":"N","precision":10,"scale":2},
+        {"dataType":"VARCHAR","name":"VU","precision":0,"scale":0,"length":16777216}],
+        "rows":[]}]}]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        set res [$conn execute {SELECT v9, b5, n, vu FROM t}]
+        $conn close
+        set out {}
+        foreach name {V9 B5 N VU} {
+            lappend out [dict get [::frostlake::result column $res $name] length]
+        }
+        set out
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {9 5 {} 16777216}
 
 # ------------------------------------------------------------------- usage
 
@@ -548,6 +591,77 @@ test transport-5.8 {break, continue and return in a transaction act on the calle
         ::fakeserver::stop $id
     }
 } -result {1 early 0 {BEGIN COMMIT BEGIN COMMIT BEGIN COMMIT BEGIN COMMIT}}
+
+# --------------------------------------------------------- statement count
+
+test transport-5.9 {no statement count goes out unless one was asked for} -body {
+    # The field is left out entirely, not sent as 0 or null: a request without
+    # it is the one the engine has always seen, and the session's
+    # MULTI_STATEMENT_COUNT decides.
+    tt::reset {dict create body [::fakeserver::ok]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        $conn execute {SELECT 1}
+        $conn close
+        tt::field multiStatementCount
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result missing
+
+test transport-5.10 {-multistatementcount rides on that one request} -body {
+    tt::reset {dict create body [::fakeserver::ok]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        $conn executeall {SELECT 1; SELECT 2} -multistatementcount 2
+        set declared [tt::field multiStatementCount]
+        # Nothing but the pack itself went out: the count rides on the request,
+        # so there is no ALTER SESSION to send and none to undo afterwards.
+        set sent $tt::seen
+        $conn execute {SELECT 3}
+        set after [tt::field multiStatementCount]
+        $conn close
+        list $declared $sent $after
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {2 {{SELECT 1; SELECT 2}} missing}
+
+test transport-5.11 {a count of 0 is how a pack asks for any number} -body {
+    tt::reset {dict create body [::fakeserver::ok]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        $conn executeall {SELECT 1; SELECT 2; SELECT 3} -multistatementcount 0
+        $conn close
+        tt::field multiStatementCount
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result 0
+
+test transport-5.12 {a count that is not a whole number of statements is refused} -body {
+    tt::reset {dict create body [::fakeserver::ok]}
+    set id [newserver]
+    try {
+        set conn [::frostlake::connect [::fakeserver::dsn $id]]
+        set out {}
+        foreach bad {-1 1.5 two 0x2} {
+            catch {$conn executeall {SELECT 1} -multistatementcount $bad} message options
+            lappend out [lrange [dict get $options -errorcode] 0 1]
+        }
+        # `render` binds and hands the text back, so a count it could not act on
+        # is refused there rather than quietly ignored.
+        catch {$conn render {SELECT 1} -multistatementcount 2} message options
+        lappend out [lrange [dict get $options -errorcode] 0 1]
+        $conn close
+        set out
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {{FROSTLAKE USAGE} {FROSTLAKE USAGE} {FROSTLAKE USAGE} {FROSTLAKE USAGE} {FROSTLAKE USAGE}}
 
 # ------------------------------------------------------------------- https
 

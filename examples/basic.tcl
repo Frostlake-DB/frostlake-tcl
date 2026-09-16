@@ -8,7 +8,7 @@
 #
 #     java -cp 'path/to/engine/lib/*' dev.frostlake.http.DatabaseHttpServer 18082
 
-lappend auto_path [file join [file dirname [file dirname [file normalize [info script]]]] lib]
+lappend auto_path [file dirname [file dirname [file normalize [info script]]]]
 package require frostlake
 
 set dsn frostlake://localhost:18082

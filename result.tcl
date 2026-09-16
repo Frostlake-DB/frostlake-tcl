@@ -11,7 +11,7 @@
 #
 # | key           | what it holds                                             |
 # | ------------- | --------------------------------------------------------- |
-# | `columns`     | one dict per column: name, datatype, nullable, precision, scale |
+# | `columns`     | one dict per column: name, datatype, nullable, precision, scale, length |
 # | `rows`        | a list of rows, each a list of cells aligned with `columns` |
 # | `updatecount` | rows affected by DML, or -1 when the statement returned data |
 # | `counters`    | the raw `number of rows ...` counters behind `updatecount` |
@@ -51,7 +51,10 @@ proc ::frostlake::result::names {result} {
     return $out
 }
 
-# One dict per column: name, datatype, nullable, precision, scale.
+# One dict per column: name, datatype, nullable, precision, scale, length.
+#
+# `length` is the declared width of a text or binary column -- characters for
+# VARCHAR, bytes for BINARY -- and "" for every other type, which has none.
 proc ::frostlake::result::columns {result} {
     return [dict get $result columns]
 }

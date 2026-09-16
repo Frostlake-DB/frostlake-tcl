@@ -8,7 +8,7 @@ namespace eval helper {
 }
 
 if {![namespace exists ::frostlake] || ![llength [info commands ::frostlake::connect]]} {
-    lappend auto_path [file join $helper::root lib]
+    lappend auto_path $helper::root
     package require frostlake
 }
 

@@ -4,11 +4,11 @@ A [Tcl](https://www.tcl-lang.org/) driver for [Frostlake](https://frostlake.dev)
 speaking the engine's HTTP protocol against a running `DatabaseHttpServer`.
 
 Nothing outside the Tcl core is needed. The JSON reader, the DSN parser, the SQL
-scanner and the HTTP client are all in `lib/`; TclTLS is required only for an
+scanner and the HTTP client are all here; TclTLS is required only for an
 `https://` DSN. Tcl 8.6 or newer.
 
 ```tcl
-lappend auto_path /path/to/frostlake-tcl/lib
+lappend auto_path /path/to/frostlake-tcl
 package require frostlake
 
 set conn [frostlake::connect frostlake://localhost:18082/MY_DB?schema=PUBLIC]
@@ -30,7 +30,7 @@ API, and the `frostlake::result` ensemble covers what `dict get` cannot.
 
 | key | what it holds |
 | --- | --- |
-| `columns` | one dict per column: `name`, `datatype`, `nullable`, `precision`, `scale` |
+| `columns` | one dict per column: `name`, `datatype`, `nullable`, `precision`, `scale`, `length` |
 | `rows` | a list of rows, each a list of cells aligned with `columns` |
 | `updatecount` | rows affected by DML, or `-1` when the statement returned data |
 | `counters` | the raw `number of rows ...` counters behind `updatecount` |
@@ -51,6 +51,11 @@ foreach row [dict get $res rows] {
     puts "$id is $name"
 }
 ```
+
+`length` is the declared width of a text or binary column -- characters for
+`VARCHAR`, bytes for `BINARY`, and `16777216` for an unbounded one, which is the
+most it could hold. Every other type has no width and reports `""`, as does a
+field an older engine never sent; `0` is never invented for it.
 
 `updatecount`, `isupdate` and `counters` read a DML answer. Frostlake reports DML
 as a status grid (`number of rows inserted`), and the driver keeps that grid *and*
@@ -284,6 +289,21 @@ $conn close                             ;# release the socket, remove the comman
 statement that returns no grid at all — DDL, a bare `USE` — still answers with
 one empty result, so `execute` always has something to hand back.
 
+### Several statements in one request
+
+The engine refuses a request holding more statements than it was told to expect.
+`-multistatementcount` says how many this one request holds:
+
+```tcl
+$conn executeall {SELECT 1; SELECT 2} -multistatementcount 2
+```
+
+`0` means any number. The count travels with that one request and outranks the
+session's `MULTI_STATEMENT_COUNT` without changing it, so nothing has to be saved
+and put back, and two connections sharing nothing but the server cannot disturb
+each other. Leave the option out and no count is sent at all — the session's
+value decides, exactly as before.
+
 `frostlake::json`, `frostlake::dsn`, `frostlake::sql` and `frostlake::bind` are
 the driver's own parts, usable on their own if you have a reason to.
 
@@ -389,17 +409,24 @@ tcltest's own options work too: `tclsh tests/all.tcl -file binding.test`,
 
 ## Layout
 
+The package files sit at the top of the repository, so the directory is itself a
+package directory: dropping it into any directory on `auto_path` is enough, and
+`tests/` and `examples/` beside them carry no `pkgIndex.tcl` and are never
+scanned.
+
 ```
-lib/errors.tcl        the three failure kinds, and the -errorcode they carry
-lib/json.tcl          a JSON reader that keeps every number's digits and every value's type
-lib/dsn.tcl           frostlake://host:port/DB?params -> a config dict
-lib/sql.tcl           the scanner both binding and scope-tracking read
-lib/values.tcl        Tcl values -> SQL literals, and the engine's text back again
-lib/binding.tcl       ? and :name placeholders, inlined client-side
-lib/result.tcl        what a statement answered with, as a plain dict
-lib/http.tcl          one keep-alive socket, with the caller's deadline on it
-lib/connection.tcl    the object that owns a socket and an engine session
-lib/tdbcfrostlake.tcl tdbc::frostlake, the TDBC driver over that object
+pkgIndex.tcl      what `package require` reads first
+frostlake.tcl     the package: sources the parts below, in dependency order
+errors.tcl        the three failure kinds, and the -errorcode they carry
+json.tcl          a JSON reader that keeps every number's digits and every value's type
+dsn.tcl           frostlake://host:port/DB?params -> a config dict
+sql.tcl           the scanner both binding and scope-tracking read
+values.tcl        Tcl values -> SQL literals, and the engine's text back again
+binding.tcl       ? and :name placeholders, inlined client-side
+result.tcl        what a statement answered with, as a plain dict
+http.tcl          one keep-alive socket, with the caller's deadline on it
+connection.tcl    the object that owns a socket and an engine session
+tdbcfrostlake.tcl tdbc::frostlake, the TDBC driver over that object
 ```
 
 ## Licence

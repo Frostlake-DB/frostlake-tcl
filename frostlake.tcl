@@ -1,7 +1,7 @@
 # A Tcl driver for Frostlake, speaking the engine's HTTP protocol against a
 # running DatabaseHttpServer.
 #
-#     lappend auto_path /path/to/frostlake-tcl/lib
+#     lappend auto_path /path/to/frostlake-tcl
 #     package require frostlake
 #
 #     set conn [frostlake::connect frostlake://localhost:18082/MY_DB?schema=PUBLIC]
@@ -32,7 +32,7 @@ package require Tcl 8.6
 package require TclOO
 
 namespace eval ::frostlake {
-    variable VERSION 0.1.0
+    variable VERSION 0.2.0
 
     # `connect` is the only name worth importing; everything else is reached
     # through its own namespace, so `namespace import ::frostlake::*` cannot
