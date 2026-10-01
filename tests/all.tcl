@@ -1,7 +1,9 @@
 # Runs the whole test suite.
 #
 #     tclsh tests/all.tcl                       unit tests only
-#     FROSTLAKE_CLASSPATH=... tclsh tests/all.tcl    everything
+#     FROSTLAKE_CLASSPATH=... tclsh tests/all.tcl    the engine-backed tests too
+#     FL_CORPUS=.../testkit FROSTLAKE_CLASSPATH=... tclsh tests/all.tcl
+#                                               everything, the testkit corpus included
 #
 # tcltest's own options are accepted after the script name, so
 # `tests/all.tcl -file binding.test` or `-match bind-3.*` narrow a run.
@@ -21,7 +23,7 @@ source [file join $here helper.tcl]
 
 set order {
     json.test dsn.test sql.test binding.test values.test result.test
-    transport.test connection.test tdbc.test suites.test
+    transport.test connection.test session.test tdbc.test suites.test
 }
 set files {}
 foreach name $order {

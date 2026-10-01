@@ -80,7 +80,8 @@ proc testserver::start {} {
     set server [dict create pid $pid port $port log $log home $home \
                             dsn "frostlake://127.0.0.1:$port"]
     if {![WaitUntilHealthy $port]} {
-        stop $server
+        #  The home stays: the log inside it is the only thing that says why.
+        stop $server 1
         error "the engine did not answer /api/health within 60s; see $log"
     }
     return $server
@@ -91,6 +92,12 @@ proc testserver::TempDir {} {
         if {[info exists ::env($name)] && [file isdirectory $::env($name)]} {
             return $::env($name)
         }
+    }
+    # With none of them set, /tmp rather than the working directory: a bare
+    # `tclsh tests/all.tcl`, and any CI that starts a build with no TMPDIR,
+    # would otherwise write the engine's home straight into the checkout.
+    if {$::tcl_platform(platform) ne "windows" && [file isdirectory /tmp]} {
+        return /tmp
     }
     return [pwd]
 }
@@ -111,9 +118,22 @@ proc testserver::WaitUntilHealthy {port {seconds 60}} {
     return 0
 }
 
-proc testserver::stop {server} {
+# Stops the server and removes the private home it was booted with.
+#
+# The home goes because nothing is still writing there — the kill is -9, and the
+# home is this server's alone — and because left behind it is tens of megabytes
+# a run, almost all of it db-engine.log, which tcltest then reports as a file
+# the suite leaked.
+#
+# `keep_home` is for the one case where the directory is the only evidence
+# there is: a boot that never became healthy, whose caller points the reader at
+# the log inside it.
+proc testserver::stop {server {keep_home 0}} {
     if {$server eq ""} { return }
     catch {exec [KillCommand] {*}[KillArguments [dict get $server pid]]}
+    if {!$keep_home} {
+        catch {file delete -force [dict get $server home]}
+    }
     return
 }
 

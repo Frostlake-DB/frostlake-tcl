@@ -26,9 +26,18 @@ oo::class create ::frostlake::Connection {
     variable sessionDefaults
     # `clock milliseconds` when this connection last had an answer, or "".
     variable lastUsed
-    # Whether the caller has selected a scope themselves; if they have, the
-    # DSN's defaults are no longer the whole truth about this session.
+    # Whether a statement left behind state a fresh session would not have: a
+    # scope the caller selected themselves (after which the DSN's defaults are
+    # no longer the whole truth about this session), a session variable or
+    # setting, or a temporary object.
     variable sessionTouched
+    # Whether the session holds an open transaction, however it was opened:
+    # `begin`, or a BEGIN or START TRANSACTION statement.
+    variable inTransaction
+    # Whether the engine reports newSession, which arrived together with
+    # requireSession and DELETE /api/sessions/{id}: "" until the first answer
+    # that names a session settles it as 1 or 0.
+    variable tracksSessions
     # The two-way stand-in for SQL NULL.
     variable nullvalue
     # Guards against a statement started from inside another one's event wait.
@@ -45,6 +54,8 @@ oo::class create ::frostlake::Connection {
         set closed 0
         set lastUsed ""
         set sessionTouched 0
+        set inTransaction 0
+        set tracksSessions ""
         set busy 0
         set nullvalue ""
         set config {}
@@ -106,12 +117,55 @@ oo::class create ::frostlake::Connection {
         my Release
     }
 
-    # Releases the socket. The HTTP API has no endpoint for ending a session, so
-    # the engine's own idle sweep is what reclaims the session behind it.
+    # Releases the engine session and the socket.
+    #
+    # An engine that reports newSession (0.1.0 and later) is sent DELETE
+    # /api/sessions/{id}, which ends the session and rolls back a transaction
+    # left open on it. The request is a courtesy: it is bounded by the shorter
+    # of the statement timeout and five seconds, and nothing it meets is raised
+    # -- a server already gone has nothing left to release. An older engine has
+    # no such endpoint and is sent nothing; its own idle sweep reclaims the
+    # session. Releasing twice sends nothing the second time.
     method Release {} {
+        if {!$closed} { my ReleaseSession }
         set closed 1
         if {[info exists sock]} { ::frostlake::http::disconnect $sock }
         set sock ""
+    }
+
+    # Sends DELETE /api/sessions/{id} for the session this connection holds,
+    # when the engine is known to have that endpoint. Never raises.
+    method ReleaseSession {} {
+        if {$sessionid eq "" || $tracksSessions ne "1"} { return }
+        set limit 5000
+        set timeout [dict get $config timeout]
+        if {$timeout > 0 && $timeout < $limit} { set limit $timeout }
+        set bounded $config
+        dict set bounded timeout $limit
+        set connecting [dict get $config connectTimeout]
+        if {$connecting <= 0 || $connecting > $limit} { set connecting $limit }
+        dict set bounded connectTimeout $connecting
+        # Every character but the unreserved ones is escaped, so the id stays
+        # one path segment whatever it holds.
+        set segment ""
+        foreach byte [split [encoding convertto utf-8 $sessionid] ""] {
+            if {[regexp {^[A-Za-z0-9._~-]$} $byte]} {
+                append segment $byte
+            } else {
+                append segment [format %%%02X [scan $byte %c]]
+            }
+        }
+        catch {
+            if {[my SocketIsStale]} {
+                ::frostlake::http::disconnect $sock
+                set sock ""
+                set sock [::frostlake::http::connect $bounded]
+            }
+            # What it answers does not matter: a 404 means the session had
+            # already gone, and anything else is not this close's to fix.
+            ::frostlake::http::exchange $sock $bounded DELETE \
+                "/api/sessions/$segment" ""
+        }
     }
 
     # Closes the connection and removes its command, the way `sqlite3` handles
@@ -296,20 +350,55 @@ oo::class create ::frostlake::Connection {
             # request declares, so the count goes only on the caller's own.
             my DrainPendingUse
             set answer [my RoundTrip $rendered $multistatementcount]
-            if {[::frostlake::sql::changesscope $sql]} { set sessionTouched 1 }
+            my NoteEffects $sql
             return [my Shape $answer]
         } finally {
             my Leave
         }
     }
 
+    # Updates what the driver knows of the session once `sql` has succeeded on
+    # it: whether it now holds state a fresh session would not have, and whether
+    # a transaction is open.
+    #
+    # A request may hold more than one statement, and a `USE` riding behind a
+    # leading `SELECT` moves the scope just as surely as one standing alone, so
+    # every statement is examined, in order.
+    method NoteEffects {sql} {
+        foreach statement [::frostlake::sql::splitstatements $sql] {
+            if {[::frostlake::sql::touchessession $statement]} { set sessionTouched 1 }
+            switch -- [::frostlake::sql::transactioneffect $statement] {
+                begins { set inTransaction 1 }
+                ends { set inTransaction 0 }
+            }
+        }
+    }
+
     # Each USE leaves the queue only once it has succeeded. A DSN naming a
     # database that does not exist has to keep failing; the alternative is later
     # statements quietly running in the default scope.
+    #
+    # A session lost part way through takes whatever part of the scope was on
+    # with it, so the whole scope goes on again, on a fresh session -- once. The
+    # DSN's own USE statements are the driver's, not the caller's, so they never
+    # count as a context the caller set up.
     method DrainPendingUse {} {
+        set restarted 0
         while {[llength $pendingUse]} {
-            my RoundTrip [lindex $pendingUse 0]
-            set pendingUse [lrange $pendingUse 1 end]
+            set statement [lindex $pendingUse 0]
+            lassign [my Post $statement] outcome decoded answer
+            if {$outcome eq "answered"} {
+                my Accept $statement $decoded $answer
+                set pendingUse [lrange $pendingUse 1 end]
+            } elseif {$restarted} {
+                my DropSession
+                ::frostlake::SessionLostError \
+                    "the engine refused a session it had just started" \
+                    [dict create statement $statement]
+            } else {
+                set restarted 1
+                my LoseSession $statement
+            }
         }
     }
 
@@ -332,15 +421,20 @@ oo::class create ::frostlake::Connection {
         return
     }
 
-    # The engine reclaims a session once it has been idle long enough, then
-    # quietly builds a fresh one for the id we keep sending -- losing the scope
-    # we selected. Nothing in the reply gives it away: the id we sent is echoed
-    # back either way. So past the limit the only safe reading is that the
-    # session is new, and the DSN's defaults go back on.
+    # An engine before 0.1.0 reclaims a session once it has been idle long
+    # enough, then quietly builds a fresh one for the id we keep sending --
+    # losing the scope we selected. Nothing in its reply gives it away: the id
+    # we sent is echoed back either way. So past the limit the only safe reading
+    # is that the session is new, and the DSN's defaults go back on.
+    #
+    # A later engine reports newSession, and refuses a session it no longer
+    # holds rather than rebuilding it (see Recover), so it is left out of the
+    # guessing.
     #
     # Not once the caller has selected a scope themselves: putting our defaults
     # over their choice is its own surprise.
     method RestoreSessionDefaults {} {
+        if {$tracksSessions ne "0"} { return }
         if {![llength $sessionDefaults] || $sessionTouched} { return }
         set limit [dict get $config idleLimit]
         if {$limit == 0 || $lastUsed eq ""} { return }
@@ -356,6 +450,7 @@ oo::class create ::frostlake::Connection {
         set autocommit 0
         try {
             my RoundTrip "BEGIN"
+            my NoteEffects "BEGIN"
         } on error {message options} {
             set autocommit 1
             return -options $options $message
@@ -370,6 +465,7 @@ oo::class create ::frostlake::Connection {
         my Enter
         try {
             my RoundTrip "COMMIT"
+            my NoteEffects "COMMIT"
         } finally {
             set autocommit 1
             my Leave
@@ -382,6 +478,7 @@ oo::class create ::frostlake::Connection {
         my Enter
         try {
             my RoundTrip "ROLLBACK"
+            my NoteEffects "ROLLBACK"
         } finally {
             set autocommit 1
             my Leave
@@ -460,11 +557,35 @@ oo::class create ::frostlake::Connection {
         return
     }
 
+    # Sends one statement and returns the decoded reply, or raises. A session
+    # the engine no longer holds is dealt with here, before anything else sees
+    # the answer: see Recover.
     method RoundTrip {sql {multistatementcount ""}} {
+        lassign [my Post $sql $multistatementcount] outcome decoded answer
+        if {$outcome eq "gone"} {
+            lassign [my Recover $sql $multistatementcount] decoded answer
+        }
+        my Accept $sql $decoded $answer
+        return $decoded
+    }
+
+    # One POST /api/execute, without any recovery. Answers `answered decoded
+    # answer`, or `gone` when the engine refused the session id as one it does
+    # not hold -- which it does only for a request that asked it to
+    # (requireSession), and then nothing ran.
+    method Post {sql {multistatementcount ""}} {
         set endpoint "[my baseurl]/api/execute"
+        set sent $sessionid
         set payload "\{\"sql\":[::frostlake::json::encode_string $sql]"
-        if {$sessionid ne ""} {
-            append payload ",\"sessionId\":[::frostlake::json::encode_string $sessionid]"
+        if {$sent ne ""} {
+            append payload ",\"sessionId\":[::frostlake::json::encode_string $sent]"
+            # Resume this session or refuse: without it, an engine whose session
+            # has gone runs the statement in a fresh one under the same id, at
+            # its default scope. Only an engine known to understand the field is
+            # sent it -- an older one's parser may refuse a field it never knew.
+            if {$tracksSessions eq "1"} {
+                append payload ",\"requireSession\":true"
+            }
         }
         append payload ",\"autoCommit\":[expr {$autocommit ? {true} : {false}}]"
         # Absent unless the caller asked for a count: a request without the
@@ -478,24 +599,121 @@ oo::class create ::frostlake::Connection {
         set answer [my Send POST /api/execute $payload]
         set decoded [my Decode $endpoint $answer]
 
+        if {$sent ne "" && [dict get $answer status] == 404
+            && ![my Succeeded $decoded] && [my NamedSession $decoded] eq ""} {
+            return [list gone {} $answer]
+        }
+        my Absorb $decoded $sent
+        return [list answered $decoded $answer]
+    }
+
+    # The session id an answer names, or "" when it names none.
+    method NamedSession {decoded} {
+        set session [::frostlake::json::at $decoded sessionId]
+        if {[::frostlake::json::type $session] eq "string"} {
+            return [::frostlake::json::value $session]
+        }
+        return ""
+    }
+
+    method Succeeded {decoded} {
+        set success [::frostlake::json::at $decoded success]
+        return [expr {[::frostlake::json::type $success] eq "bool"
+                      && [::frostlake::json::value $success]}]
+    }
+
+    # Takes in what an answer says of the session: the id it ran in and, from
+    # the presence of newSession, whether the engine tracks sessions at all.
+    method Absorb {decoded sent} {
         # On a failure the engine answers with sessionId null, so the id is
         # taken only when it is really there -- otherwise one bad statement
         # would drop the session and silently start a new one.
-        set session [::frostlake::json::at $decoded sessionId]
-        if {[::frostlake::json::type $session] eq "string"
-            && [::frostlake::json::value $session] ne ""} {
-            set sessionid [::frostlake::json::value $session]
+        set session [my NamedSession $decoded]
+        if {$session eq ""} { return }
+        set sessionid $session
+        set started [::frostlake::json::at $decoded newSession]
+        if {[::frostlake::json::type $started] eq "bool"} {
+            set tracksSessions 1
+            if {[::frostlake::json::value $started] && $sent ne ""} {
+                # The engine ran the statement in a fresh session in place of
+                # ours: whatever the old one held is gone, and the DSN's scope
+                # goes back on before the next statement.
+                my ResetSession
+            }
+        } elseif {$tracksSessions eq ""} {
+            set tracksSessions 0
         }
+    }
 
-        set success [::frostlake::json::at $decoded success]
-        if {!([::frostlake::json::type $success] eq "bool"
-              && [::frostlake::json::value $success])} {
+    # Raises the engine's refusal of `sql`, when that is what `decoded` reports.
+    method Accept {sql decoded answer} {
+        if {![my Succeeded $decoded]} {
             ::frostlake::QueryError \
                 [my FailureMessage $decoded $answer] \
                 [dict create statement $sql status [dict get $answer status]]
         }
         set lastUsed [clock milliseconds]
-        return $decoded
+    }
+
+    # The engine no longer holds this connection's session -- it expired, was
+    # released, or the server restarted -- and nothing ran.
+    #
+    # With a transaction or a moved context gone along with it, running `sql`
+    # again would put it somewhere its author did not intend, so that is
+    # refused. Otherwise a fresh session on the DSN's scope takes over and `sql`
+    # is sent once more; a second refusal is raised rather than chased.
+    method Recover {sql multistatementcount} {
+        my LoseSession $sql
+        my DrainPendingUse
+        lassign [my Post $sql $multistatementcount] outcome decoded answer
+        if {$outcome eq "gone"} {
+            my DropSession
+            ::frostlake::SessionLostError "the engine refused a session it had\
+                just started; the statement did not run" \
+                [dict create statement $sql]
+        }
+        return [list $decoded $answer]
+    }
+
+    # Forgets a session the engine no longer holds, and raises a SESSIONLOST
+    # failure when it held something a fresh session would not have. Returns
+    # when `sql` may be sent again on a fresh session.
+    method LoseSession {sql} {
+        set hadTransaction $inTransaction
+        set hadContext $sessionTouched
+        my DropSession
+        if {$hadTransaction} {
+            # The transaction went with the session, so the connection is back
+            # in autocommit mode, as the fresh session will be.
+            set autocommit 1
+            ::frostlake::SessionLostError "the engine no longer holds this\
+                connection's session (it expired, was released, or the server\
+                restarted), so its open transaction is gone; the statement did\
+                not run" [dict create statement $sql]
+        }
+        if {$hadContext} {
+            ::frostlake::SessionLostError "the engine no longer holds this\
+                connection's session (it expired, was released, or the server\
+                restarted), and the context set up on it (USE, SET, ALTER\
+                SESSION or a temporary object) went with it, so the statement\
+                was not run again; the next statement starts a fresh session on\
+                the connection's scope" [dict create statement $sql]
+        }
+    }
+
+    # Forgets the session id and what the driver knew of the session behind it,
+    # so the next statement starts a fresh one on the DSN's scope.
+    method DropSession {} {
+        set sessionid ""
+        my ResetSession
+    }
+
+    # Back to what a fresh session holds: none of the caller's context, no
+    # transaction, and the DSN's scope still to apply.
+    method ResetSession {} {
+        set sessionTouched 0
+        set inTransaction 0
+        set pendingUse $sessionDefaults
     }
 
     # Sends one request, opening the socket if this connection has none and
@@ -707,7 +925,7 @@ oo::class create ::frostlake::Connection {
 # | ----------------- | --------------------------------------------------------- |
 # | `-timeout`        | how long one statement may take                            |
 # | `-connecttimeout` | how long to wait for the socket                            |
-# | `-idlelimit`      | how long a connection may idle before its scope is re-applied |
+# | `-idlelimit`      | how long a connection may idle before its scope is re-applied, on an engine before 0.1.0 |
 # | `-nullvalue`      | the stand-in for SQL NULL, in both directions (default "") |
 # | `-database` `-schema` `-role` `-warehouse` | the session's scope       |
 # | `-cacert`         | a CA bundle for HTTPS, instead of the system's             |

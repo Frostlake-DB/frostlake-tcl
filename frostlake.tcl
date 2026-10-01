@@ -17,7 +17,7 @@
 #
 # The pieces, in dependency order:
 #
-#   errors      the three failure kinds, and the -errorcode they carry
+#   errors      the four failure kinds, and the -errorcode they carry
 #   json        a JSON reader that keeps every number's digits and every
 #               value's type
 #   dsn         frostlake://host:port/DB?params -> a config dict

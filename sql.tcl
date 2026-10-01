@@ -8,7 +8,8 @@
 # Positions are character indices, which is what Tcl's string commands take.
 
 namespace eval ::frostlake::sql {
-    namespace export skipenclosure splitstatements changesscope leadingwords
+    namespace export skipenclosure splitstatements changesscope leadingwords \
+        touchessession transactioneffect
     namespace ensemble create
 }
 
@@ -19,7 +20,11 @@ namespace eval ::frostlake::sql {
     # Modifiers that may sit between CREATE/DROP/ALTER and the kind of object
     # being named.
     variable OBJECT_MODIFIERS {OR REPLACE TRANSIENT TEMPORARY TEMP VOLATILE
-                               LOCAL GLOBAL SECURE IF NOT EXISTS}
+                               LOCAL GLOBAL SECURE IF NOT EXISTS PUBLIC PRIVATE
+                               ICEBERG DYNAMIC HYBRID EVENT RECURSIVE
+                               MATERIALIZED EXTERNAL}
+    # The modifiers that make a created object live and die with the session.
+    variable TEMPORARY_MODIFIERS {TEMPORARY TEMP VOLATILE}
 }
 
 proc ::frostlake::sql::IsWordChar {c} {
@@ -166,7 +171,7 @@ proc ::frostlake::sql::changesscope {sql} {
 # where it was, and counting those would mark the session dirty for every DDL
 # statement a caller runs.
 proc ::frostlake::sql::StatementChangesScope {statement} {
-    set words [leadingwords $statement 6]
+    set words [leadingwords $statement 16]
     if {![llength $words]} { return 0 }
     switch -- [lindex $words 0] {
         USE - SET - UNSET { return 1 }
@@ -174,6 +179,35 @@ proc ::frostlake::sql::StatementChangesScope {statement} {
         CREATE - DROP { return [NamesObject [lrange $words 1 end] {DATABASE SCHEMA}] }
     }
     return 0
+}
+
+# Whether one statement leaves behind state a fresh session would not have: a
+# moved scope, a session variable or setting, or a temporary object --
+# `CREATE TEMPORARY TABLE`, `CREATE OR REPLACE LOCAL TEMP VIEW` -- which lives
+# only as long as the session.
+proc ::frostlake::sql::touchessession {statement} {
+    variable OBJECT_MODIFIERS
+    variable TEMPORARY_MODIFIERS
+    if {[StatementChangesScope $statement]} { return 1 }
+    set words [leadingwords $statement 16]
+    if {[lindex $words 0] ne "CREATE"} { return 0 }
+    foreach word [lrange $words 1 end] {
+        if {$word ni $OBJECT_MODIFIERS} { return 0 }
+        if {$word in $TEMPORARY_MODIFIERS} { return 1 }
+    }
+    return 0
+}
+
+# What one statement does to the session's transaction: `begins`, `ends`, or
+# "". BEGIN on its own -- or followed by TRANSACTION, WORK or NAME -- opens one,
+# and so does START TRANSACTION; BEGIN followed by a statement opens a scripting
+# block instead, which is no transaction at all.
+proc ::frostlake::sql::transactioneffect {statement} {
+    lassign [leadingwords $statement 2] first second
+    if {$first eq "BEGIN" && $second in {"" TRANSACTION WORK NAME}} { return begins }
+    if {$first eq "START" && $second eq "TRANSACTION"} { return begins }
+    if {$first in {COMMIT ROLLBACK}} { return ends }
+    return ""
 }
 
 # Walks the words between the verb and the object being named, stepping over

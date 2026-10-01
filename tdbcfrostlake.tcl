@@ -79,7 +79,9 @@ proc ::tdbc::frostlake::Fail {sqlstate detail message} {
 #
 # The HTTP protocol carries no SQLSTATE, so a refused statement is HY000. A
 # transport failure reports `connectionState`: 08001 while the connection is
-# being made, 08006 once it is up.
+# being made, 08006 once it is up. A session the engine no longer holds, taking
+# a transaction or a context with it, is 08003: the statement did not run, and
+# the session it was meant for does not exist any more.
 proc ::tdbc::frostlake::Call {connectionState args} {
     try {
         return [uplevel 1 $args]
@@ -87,6 +89,7 @@ proc ::tdbc::frostlake::Call {connectionState args} {
         lassign [dict get $options -errorcode] - kind detail
         set sqlstate HY000
         if {$kind eq "CONNECTION"} { set sqlstate $connectionState }
+        if {$kind eq "SESSIONLOST"} { set sqlstate 08003 }
         Fail $sqlstate [list $kind $detail] $message
     }
 }

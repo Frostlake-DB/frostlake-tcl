@@ -1,0 +1,581 @@
+# Runs the engine-owned, language-neutral JSON test suites through THIS driver.
+#
+# The definitions live in the frostlake repo
+# (`engine/src/test/resources/testkit/suites/*.json`, spec in `SCHEMA.md` next
+# to them); every statement travels connect -> HTTP -> DatabaseHttpServer. The
+# engine owns the definitions and this file is only the Tcl driver's runner, so
+# suites added on the engine side are picked up here with no driver change.
+#
+#     FL_CORPUS=/path/to/frostlake/engine/src/test/resources/testkit \
+#     JAVA_HOME=... FROSTLAKE_CLASSPATH=... tclsh tests/all.tcl
+#
+# FL_CORPUS names that testkit directory; the suites are read from its
+# `suites`. Without FL_CORPUS the corpus skips, and without FROSTLAKE_CLASSPATH
+# every case skips -- never falsely green. FL_CORPUS naming a directory with no
+# suites fails the run. FROSTLAKE_TESTKIT_FILTER narrows the run to the suites
+# whose file name contains it.
+#
+# Semantics (mirrors SCHEMA.md and the Go, Ruby, dotnet, Julia and Dart runners):
+#
+#  * backend name for a suite's skip clause: `tcl`; `http` entries are honoured
+#    too, because this driver rides the HTTP transport and the same engine.
+#  * per-test isolation: CREATE OR REPLACE DATABASE test_db -> USE ->
+#    CREATE OR REPLACE SCHEMA test_schema -> USE, then the steps, in order, on
+#    ONE connection -- which is what keeps USE, variables and transactions on a
+#    single session.
+#  * capabilities: SESSION, COLUMN_NAMES, UPDATE_COUNT. No ERROR_CODE -- the
+#    HTTP protocol carries a message only, so expected-error code/sqlState
+#    checks are recorded as missing-API notes instead of failing.
+#  * suite files run in name order, because the corpus is order-sensitive by
+#    design: account-level objects outlive the per-test reset, so a suite whose
+#    fixture does a bare CREATE WAREHOUSE has to run before the ones that
+#    create the same name with IF NOT EXISTS.
+#
+# FROSTLAKE_TESTKIT_SESSION picks how much session a connection spans:
+# `suite` (the default, one connection per file), `test` (one per case, the
+# strictest isolation) or `run` (one for the whole corpus, which is the
+# harshest on session leaks and the kindest to the machine's TCP ports).
+
+source [file join [file dirname [info script]] helper.tcl]
+namespace import -force ::tcltest::*
+
+namespace eval kit {
+    variable BACKEND tcl
+
+    # Capabilities this transport cannot express, and the driver limits a case
+    # ran into. Written out next to the results rather than failed on.
+    variable notes {}
+    variable records {}
+    variable passed 0
+    variable failed 0
+    variable skipped 0
+
+    variable sessionmode suite
+    variable conn ""
+    variable server ""
+
+    # Set when the engine stops answering. Everything after that point would
+    # fail for the same reason, and several hundred identical "connection
+    # refused" lines bury the one fact worth reporting -- so the run stops here
+    # instead and says what happened.
+    variable aborted ""
+}
+
+# ------------------------------------------------------------- finding things
+
+proc kit::suitefiles {directory} {
+    if {$directory eq ""} { return {} }
+    set files [lsort [glob -nocomplain -directory $directory *.json]]
+    if {![info exists ::env(FROSTLAKE_TESTKIT_FILTER)] || $::env(FROSTLAKE_TESTKIT_FILTER) eq ""} {
+        return $files
+    }
+    set filter $::env(FROSTLAKE_TESTKIT_FILTER)
+    set out {}
+    foreach file $files {
+        if {[string first $filter [file tail $file]] >= 0} { lappend out $file }
+    }
+    return $out
+}
+
+# ---------------------------------------------------------------- connections
+
+proc kit::dsn {} {
+    variable server
+    return [dict get $server dsn]
+}
+
+proc kit::newconnection {} {
+    set conn [::frostlake::connect [dsn]]
+    # A case whose step holds several statements is a pack, which the engine refuses unless the
+    # session asks for one; the corpus asks for any number.
+    catch {$conn execute {ALTER SESSION SET MULTI_STATEMENT_COUNT = 0}}
+    return $conn
+}
+
+# The connection a case runs on, per the session mode.
+proc kit::acquire {} {
+    variable sessionmode
+    variable conn
+    if {$sessionmode eq "test"} { return [newconnection] }
+    if {$conn eq ""} { set conn [newconnection] }
+    return $conn
+}
+
+proc kit::releasecase {c} {
+    variable sessionmode
+    if {$sessionmode eq "test"} { catch {$c close} }
+}
+
+proc kit::releasesuite {} {
+    variable sessionmode
+    variable conn
+    if {$sessionmode ne "run" && $conn ne ""} {
+        catch {$conn close}
+        set conn ""
+    }
+}
+
+proc kit::releaseall {} {
+    variable conn
+    if {$conn ne ""} {
+        catch {$conn close}
+        set conn ""
+    }
+}
+
+# Whether a Frostlake engine is still answering on the DSN at all. Asked only
+# after a transport failure, to tell "this one statement broke the connection"
+# apart from "the engine is gone".
+proc kit::enginealive {} {
+    if {[catch {newconnection} c]} { return 0 }
+    catch {$c close}
+    return 1
+}
+
+# ---------------------------------------------------------------- one step
+
+# A client is handed a VARIANT, OBJECT or ARRAY cell as its JSON text -- a
+# string's own quotes included -- which is what the account's own drivers do and
+# what a real caller should see. The suites record the VALUE instead: `a` rather
+# than `"a"`, and an object as its own text rather than as a string holding that
+# text. So a cell on one of those columns is decoded once before it is compared,
+# or the same case passes on the engine's own runner and fails here over a
+# difference nobody cares about.
+#
+# Read from the type the engine declared, not from the cell's shape, so a
+# VARCHAR whose content happens to look like `"quoted"` keeps its quotes.
+proc kit::semistructured {column} {
+    if {![dict exists $column datatype]} { return 0 }
+    return [expr {[string toupper [dict get $column datatype]] in {VARIANT OBJECT ARRAY}}]
+}
+
+# One level, and nothing else: a cell that IS a JSON string becomes that
+# string's content, which for a whole object or array is the object's own text.
+# Anything else -- a number, a boolean, text that is not JSON at all -- is left
+# exactly as it came.
+proc kit::semistructuredvalue {cell} {
+    if {[catch {::frostlake::json parse $cell} decoded]} { return $cell }
+    if {[::frostlake::json type $decoded] ne "string"} { return $cell }
+    return [::frostlake::json value $decoded]
+}
+
+# A result's grid, with every semi-structured cell read as its value.
+proc kit::grid {res} {
+    set semi {}
+    foreach column [::frostlake::result columns $res] {
+        lappend semi [semistructured $column]
+    }
+    set out {}
+    foreach row [::frostlake::result rows $res] {
+        set cells {}
+        set i 0
+        foreach cell $row {
+            if {[lindex $semi $i] eq 1} { set cell [semistructuredvalue $cell] }
+            lappend cells $cell
+            incr i
+        }
+        lappend out $cells
+    }
+    return $out
+}
+
+# What one step produced: a grid, an update count, or a failure. A transport
+# failure is distinguished from a refused statement, because SCHEMA.md's ERROR
+# status means "infrastructure", not "the engine said no".
+proc kit::runstep {c sql} {
+    try {
+        set res [$c execute $sql]
+        return [dict create \
+            columns [::frostlake::result names $res] \
+            rows [kit::grid $res] \
+            updatecount [::frostlake::result updatecount $res] \
+            error "" broken 0]
+    } trap {FROSTLAKE CONNECTION} {message} {
+        return [dict create columns {} rows {} updatecount -1 error $message broken 1]
+    } trap {FROSTLAKE} {message} {
+        return [dict create columns {} rows {} updatecount -1 error $message broken 0]
+    }
+}
+
+# The reset sequence SCHEMA.md prescribes: every case starts in an empty
+# test_db.test_schema.
+proc kit::resetcontext {c} {
+    foreach sql {
+        {CREATE OR REPLACE DATABASE test_db}
+        {USE DATABASE test_db}
+        {CREATE OR REPLACE SCHEMA test_schema}
+        {USE SCHEMA test_schema}
+    } {
+        set outcome [runstep $c $sql]
+        if {[dict get $outcome error] ne ""} {
+            return [list "resetContext failed on \"$sql\": [dict get $outcome error]" \
+                         [dict get $outcome broken]]
+        }
+    }
+    return [list "" 0]
+}
+
+# A suite may declare that a backend cannot run a case.
+proc kit::skipreason {entry} {
+    variable BACKEND
+    set skip [::frostlake::json at $entry skip]
+    if {[::frostlake::json type $skip] ne "object"} { return "" }
+    set backends [::frostlake::json at $skip backends]
+    if {[::frostlake::json type $backends] ne "array"} { return "" }
+    set named {}
+    foreach b [::frostlake::json value $backends] {
+        lappend named [string tolower [::frostlake::json scalar $b]]
+    }
+    if {$BACKEND ni $named && "http" ni $named} { return "" }
+    set reason [::frostlake::json at $skip reason]
+    set text "no reason given"
+    if {[::frostlake::json type $reason] eq "string"} {
+        set text [::frostlake::json value $reason]
+    }
+    return "declared in the suite: $text"
+}
+
+# Runs one case. Answers {problem broken}: an empty problem means it passed.
+proc kit::runcase {entry} {
+    set c [acquire]
+    try {
+        lassign [resetcontext $c] problem broken
+        if {$problem ne ""} { return [list $problem $broken] }
+        set steps [::frostlake::json at $entry steps]
+        if {[::frostlake::json type $steps] ne "array"} { return [list "" 0] }
+        set n 0
+        foreach step [::frostlake::json value $steps] {
+            incr n
+            if {[::frostlake::json type $step] ne "object"} { continue }
+            set sql [::frostlake::json scalar [::frostlake::json at $step sql]]
+            set outcome [runstep $c $sql]
+            if {[dict get $outcome broken]} {
+                return [list "step $n: [dict get $outcome error]\n  \[sql: $sql\]" 1]
+            }
+            set problem [check [::frostlake::json at $step expect] $outcome $sql]
+            if {$problem eq ""} { continue }
+            return [list "step $n: $problem\n  \[sql: $sql\]" 0]
+        }
+        return [list "" 0]
+    } finally {
+        releasecase $c
+    }
+}
+
+# ------------------------------------------------------------- expectations
+
+proc kit::check {expectation outcome sql} {
+    variable notes
+    variable BACKEND
+
+    if {[::frostlake::json type $expectation] ne "object"} {
+        if {[dict get $outcome error] eq ""} { return "" }
+        return "unexpected error: [dict get $outcome error]"
+    }
+
+    if {[::frostlake::json exists $expectation error]} {
+        if {[dict get $outcome error] eq ""} {
+            return "expected an error, the statement succeeded"
+        }
+        set expected [::frostlake::json at $expectation error]
+        if {[::frostlake::json type $expected] eq "object"} {
+            if {[::frostlake::json exists $expected messageContains]} {
+                set wanted [::frostlake::json scalar [::frostlake::json at $expected messageContains]]
+                if {[string first [string tolower $wanted] \
+                         [string tolower [dict get $outcome error]]] < 0} {
+                    # A blank statement is refused by the HTTP endpoint itself
+                    # -- 400, "SQL is required" -- so the engine never runs it
+                    # and never produces its own wording. No driver over this
+                    # transport can, which makes it a capability gap rather
+                    # than a mismatch. The statement did still fail.
+                    if {[string trim $sql] eq ""} {
+                        note "EMPTY_STATEMENT: the HTTP API refuses a blank statement\
+                              itself (HTTP 400 \"SQL is required\"), so the engine's own\
+                              \"Empty SQL statement.\" error cannot be observed over this\
+                              transport"
+                        return ""
+                    }
+                    return "the error \[[dict get $outcome error]\] does not contain \[$wanted\]"
+                }
+            }
+            if {[::frostlake::json exists $expected code]
+                || [::frostlake::json exists $expected sqlState]} {
+                note "ERROR_CODE: failures carry a message only, so an error code or\
+                      SQLSTATE cannot be checked"
+            }
+        }
+        return ""
+    }
+
+    if {[dict get $outcome error] ne ""} {
+        return "unexpected error: [dict get $outcome error]"
+    }
+
+    if {[::frostlake::json exists $expectation value]} {
+        set rows [dict get $outcome rows]
+        # Not `expr`: its ternary reads each branch as a number where it can,
+        # and a cell holding the text "NaN" -- which VECTOR_COSINE_SIMILARITY
+        # of a zero vector really does return -- becomes a domain error rather
+        # than a value to compare.
+        set actual ""
+        if {[llength $rows]} { set actual [lindex $rows 0 0] }
+        set wanted [::frostlake::json scalar [::frostlake::json at $expectation value]]
+        if {[normalize $wanted] ne [normalize $actual]} {
+            return "value \[$actual\] != expected \[$wanted\]"
+        }
+    }
+
+    set wantedrows [::frostlake::json at $expectation rows]
+    if {[::frostlake::json type $wantedrows] eq "array"} {
+        set want {}
+        foreach row [::frostlake::json value $wantedrows] {
+            if {[::frostlake::json type $row] ne "array"} { continue }
+            set cells {}
+            foreach cell [::frostlake::json value $row] {
+                lappend cells [normalize [::frostlake::json scalar $cell]]
+            }
+            lappend want [join $cells " | "]
+        }
+        set got {}
+        foreach row [dict get $outcome rows] {
+            set cells {}
+            foreach cell $row { lappend cells [normalize $cell] }
+            lappend got [join $cells " | "]
+        }
+        set ordered [::frostlake::json at $expectation ordered]
+        if {!([::frostlake::json type $ordered] eq "bool" && [::frostlake::json value $ordered])} {
+            set want [lsort $want]
+            set got [lsort $got]
+        }
+        if {$want ne $got} {
+            return "rows differ:\n    expected $want\n    got      $got"
+        }
+    }
+
+    if {[::frostlake::json exists $expectation rowCount]} {
+        set want [asinteger [::frostlake::json at $expectation rowCount]]
+        set got [llength [dict get $outcome rows]]
+        if {$want ne "" && $got != $want} {
+            return "rowCount $got != expected $want"
+        }
+    }
+
+    set wantedcolumns [::frostlake::json at $expectation columns]
+    if {[::frostlake::json type $wantedcolumns] eq "array"} {
+        set want {}
+        foreach column [::frostlake::json value $wantedcolumns] {
+            lappend want [string toupper [::frostlake::json scalar $column]]
+        }
+        set got {}
+        foreach name [dict get $outcome columns] { lappend got [string toupper $name] }
+        if {$want ne $got} {
+            return "columns $got != expected $want"
+        }
+    }
+
+    if {[::frostlake::json exists $expectation updateCount]} {
+        set want [asinteger [::frostlake::json at $expectation updateCount]]
+        set got [dict get $outcome updatecount]
+        if {$want ne "" && $got != $want} {
+            return "updateCount $got != expected $want"
+        }
+    }
+
+    return ""
+}
+
+proc kit::asinteger {json} {
+    set text [::frostlake::json scalar $json]
+    if {[regexp {^-?(?:0|[1-9][0-9]*)$} $text]} { return $text }
+    return ""
+}
+
+# SCHEMA.md value normalization, applied to both sides before comparing:
+# null/empty becomes NULL, booleans compare case-insensitively, anything
+# numeric compares as a number rounded to 10 significant digits, and everything
+# else is an exact trimmed string.
+proc kit::normalize {value} {
+    set text [string trim $value]
+    if {$text eq ""} { return NULL }
+    set folded [string tolower $text]
+    switch -- $folded {
+        null  { return NULL }
+        true  { return TRUE }
+        false { return FALSE }
+    }
+    if {[string is double -strict $text]} {
+        if {![catch {expr {double($text)}} number]} {
+            # The infinities and NaN are not numbers to round; compare them as
+            # the text they arrived as.
+            if {![string match -nocase {*inf*} $number]
+                && ![string match -nocase {*nan*} $number]} {
+                if {$number == 0} { return 0 }
+                # Ten significant digits with trailing zeros dropped, so 2 and
+                # 2.000000 compare equal and so do 3.5 and 3.500000.
+                return [format %.10g $number]
+            }
+        }
+    }
+    return $text
+}
+
+proc kit::note {text} {
+    variable notes
+    variable BACKEND
+    set line "missing-API \[$BACKEND\] [regsub -all {\s+} $text " "]"
+    if {$line ni $notes} { lappend notes $line }
+}
+
+proc kit::record {suite name status step detail ms} {
+    variable records
+    lappend records [join [list $suite $name $status $step \
+        [string map [list \n " " \t " " \r ""] $detail] $ms] \t]
+}
+
+# ---------------------------------------------------------------- one file
+
+# Runs every case in one suite file. Answers the list of failures, each as
+# "case: problem" -- empty when the whole file passed.
+proc kit::runfile {file} {
+    variable passed
+    variable failed
+    variable skipped
+
+    set fh [::open $file r]
+    fconfigure $fh -encoding utf-8
+    set text [read $fh]
+    close $fh
+
+    set suite [::frostlake::json parse $text]
+    set name [file rootname [file tail $file]]
+    set cases [::frostlake::json at $suite tests]
+    if {[::frostlake::json type $cases] ne "array"} { return {} }
+
+    set failures {}
+    try {
+        foreach entry [::frostlake::json value $cases] {
+            if {[::frostlake::json type $entry] ne "object"} { continue }
+            set casename [::frostlake::json scalar [::frostlake::json at $entry name] "(unnamed)"]
+            set reason [skipreason $entry]
+            if {$reason ne ""} {
+                incr skipped
+                record $name $casename SKIP "" $reason 0
+                continue
+            }
+            set started [clock milliseconds]
+            if {[catch {runcase $entry} outcome]} {
+                set problem "ERROR: $outcome"
+                set broken 1
+            } else {
+                lassign $outcome problem broken
+            }
+            set ms [expr {[clock milliseconds] - $started}]
+            if {$problem eq ""} {
+                incr passed
+                record $name $casename PASS "" "" $ms
+            } else {
+                incr failed
+                lappend failures "$casename: $problem"
+                set step ""
+                regexp {^step (\d+):} $problem -> step
+                set status [expr {$broken ? "ERROR" : "FAIL"}]
+                record $name $casename $status $step $problem $ms
+                if {$broken && ![enginealive]} {
+                    variable aborted
+                    set aborted "the engine stopped answering during\
+                        $name/$casename; the rest of the corpus did not run"
+                    break
+                }
+            }
+        }
+    } finally {
+        releasesuite
+    }
+    return $failures
+}
+
+proc kit::writeresults {} {
+    variable records
+    variable notes
+    variable BACKEND
+    set directory [file join [file dirname [file dirname [file normalize [info script]]]] results]
+    file mkdir $directory
+
+    set fh [::open [file join $directory testkit-$BACKEND.tsv] w]
+    fconfigure $fh -encoding utf-8 -translation lf
+    puts $fh [join {suite test status failedStep detail ms} \t]
+    foreach line $records { puts $fh $line }
+    close $fh
+
+    if {[llength $notes]} {
+        set fh [::open [file join $directory missing-apis-$BACKEND.md] w]
+        fconfigure $fh -encoding utf-8 -translation lf
+        puts $fh "# Missing APIs -- $BACKEND backend\n"
+        foreach line [lsort $notes] { puts $fh "- $line" }
+        close $fh
+    }
+}
+
+# ------------------------------------------------------------------- the run
+
+# FL_CORPUS is read first: without it the corpus is one skipped test, and
+# nothing looks for suites or an engine.
+testConstraint corpus [expr {[info exists ::env(FL_CORPUS)] && $::env(FL_CORPUS) ne ""}]
+if {![testConstraint corpus]} {
+    puts [outputChannel] "  skipping the testkit suites: set FL_CORPUS to frostlake's\
+        engine/src/test/resources/testkit to replay the testkit corpus"
+    test suites-corpus {the canonical corpus} -constraints corpus -body {} -result {}
+    cleanupTests
+    return
+}
+
+set kit::directory [file join $::env(FL_CORPUS) suites]
+if {![llength [glob -nocomplain -directory $kit::directory *.json]]} {
+    # Asked for and not there: a failure rather than a skip.
+    test suites-corpus {the canonical corpus} -body [list error "FL_CORPUS=$::env(FL_CORPUS)\
+        holds no suites/*.json; point it at frostlake's engine/src/test/resources/testkit"] \
+        -result {}
+    cleanupTests
+    return
+}
+
+testConstraint engine [::testserver::available]
+
+if {[info exists ::env(FROSTLAKE_TESTKIT_SESSION)] && $::env(FROSTLAKE_TESTKIT_SESSION) ne ""} {
+    set kit::sessionmode $::env(FROSTLAKE_TESTKIT_SESSION)
+    if {$kit::sessionmode ni {run suite test}} {
+        error "FROSTLAKE_TESTKIT_SESSION must be run, suite or test"
+    }
+}
+
+if {![::testserver::available]} {
+    puts [outputChannel] "  skipping the testkit suites: [::testserver::skipreason]"
+    testConstraint engine 0
+} else {
+    set kit::files [kit::suitefiles $kit::directory]
+    puts [outputChannel] "  running [llength $kit::files] testkit suite file(s)\
+        from $kit::directory (session per $kit::sessionmode)"
+    set kit::server [::testserver::shared]
+
+    foreach kit::file $kit::files {
+        if {$kit::aborted ne ""} break
+        test suites-[file rootname [file tail $kit::file]] \
+            {a canonical suite file} -constraints engine -body \
+            [list kit::runfile $kit::file] -result {}
+    }
+
+    if {$kit::aborted ne ""} {
+        test suites-engine-survived-the-corpus {the engine answered throughout} \
+            -constraints engine -body {set kit::aborted} -result {}
+    }
+
+    kit::releaseall
+    kit::writeresults
+    puts [outputChannel] "  testkit: $kit::passed passed, $kit::failed failed,\
+        $kit::skipped skipped"
+    if {[llength $kit::notes]} {
+        puts [outputChannel] "  [llength $kit::notes] missing-API note(s) recorded"
+    }
+}
+
+cleanupTests

@@ -586,7 +586,7 @@ test tdbc-10.5 {a transaction keeps its rows, and a failed one keeps none} -cons
 test tdbc-10.6 {a refused statement carries TDBC's code and the engine's wording} -constraints tdbcengine -body {
     catch {[te::db] allrows {SELECT * FROM no_such_table}} message options
     list [lrange [dict get $options -errorcode] 0 4] [::helper::flatten $message]
-} -result {{TDBC GENERAL_ERROR HY000 FROSTLAKE QUERY} {SQL compilation error: Object 'NO_SUCH_TABLE' does not exist or not authorized.}}
+} -result {{TDBC GENERAL_ERROR HY000 FROSTLAKE QUERY} {SQL compilation error: Object 'NO_SUCH_TABLE' does not exist or not authorized. Your primary role SYSADMIN must have at least one privilege granted on TABLE NO_SUCH_TABLE.}}
 
 test tdbc-10.7 {tables and columns of the current schema, found the way the engine resolves a name} -constraints tdbcengine -body {
     set db [te::db]

@@ -10,11 +10,13 @@
 #         # the engine refused the statement
 #     } trap {FROSTLAKE CONNECTION} {message} {
 #         # the request never became an answer
+#     } trap {FROSTLAKE SESSIONLOST} {message} {
+#         # the session went, and took a transaction or a context with it
 #     } trap {FROSTLAKE} {message} {
 #         # anything else this driver raised
 #     }
 #
-# `trap {FROSTLAKE}` catches all three, so a caller who does not care which
+# `trap {FROSTLAKE}` catches all four, so a caller who does not care which
 # kind it was writes one clause.
 #
 # Each code carries a third element: a dict of whatever detail the failure had
@@ -55,6 +57,21 @@ proc ::frostlake::ConnectionError {message {detail {}}} {
 # and treat the detail dict as sensitive.
 proc ::frostlake::QueryError {message {detail {}}} {
     return -code error -errorcode [list FROSTLAKE QUERY $detail] $message
+}
+
+# The engine no longer holds the connection's session -- it expired, was
+# released, or the server restarted -- and the statement did NOT run.
+#
+# Raised instead of running the statement again when the lost session held
+# something a fresh one would not have: an open transaction, or a context set up
+# with USE, SET, ALTER SESSION or a temporary object. A session that held
+# neither is replaced without a word, and the statement is sent once more. The
+# connection stays usable: the next statement starts a fresh session on the
+# DSN's scope.
+#
+# `detail` carries `statement`, as sensitive as a QUERY failure's.
+proc ::frostlake::SessionLostError {message {detail {}}} {
+    return -code error -errorcode [list FROSTLAKE SESSIONLOST $detail] $message
 }
 
 # The detail dict of a failure, given the error code from `$::errorCode` or from

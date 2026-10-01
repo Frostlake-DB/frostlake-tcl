@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- Session lifetime. Against an engine that reports `newSession` (0.1.0 and
+  later), every request naming the session carries `requireSession: true`, so
+  a session the engine no longer holds is refused with a 404 rather than
+  quietly replaced by a fresh one at the default scope. The driver then drops
+  the id, puts the DSN's scope on a fresh session and sends the statement once
+  more; when the lost session held an open transaction or a context (`USE`,
+  `SET`, `ALTER SESSION`, a temporary object) it raises the new
+  `FROSTLAKE SESSIONLOST` failure instead, and the statement does not run.
+  `tdbc::frostlake` reports that failure as `CONNECTION_EXCEPTION 08003`.
+- Closing a connection releases its session with `DELETE /api/sessions/{id}`,
+  which also rolls back a transaction left open on it: best effort, bounded by
+  the shorter of `-timeout` and five seconds, and never raised. An older engine
+  is sent neither the field nor the request.
+- The `-idlelimit` re-scope is left to engines before 0.1.0, which give no
+  sign that a session was replaced.
+
 ## 0.2.0
 
 - The package files moved from `lib/` to the top of the repository, so the

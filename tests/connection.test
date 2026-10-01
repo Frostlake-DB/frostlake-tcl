@@ -51,6 +51,20 @@ namespace eval ct {
         return $out
     }
 
+    # Whether this engine keeps the UTC offset a TIMESTAMP_TZ was written with.
+    # Older ones normalise the value to UTC and answer +0000 whatever went in.
+    #
+    # A probe that cannot be taken answers yes, so the case it guards runs and
+    # says what went wrong.
+    proc keepsoffset {} {
+        if {[catch {
+            set res [[conn] execute \
+                {SELECT '2024-01-15 10:30:00 +01:00'::TIMESTAMP_TZ}]
+            string match {*+0100} [::frostlake::result value $res]
+        } out]} { return 1 }
+        return $out
+    }
+
     # Whether this engine refuses a statement pack nobody asked for. Only one
     # carrying the statement-count gate does; an older engine runs any pack it
     # is handed. Its own connection, so the session is at the default count of
@@ -154,18 +168,34 @@ test conn-3.4 {the engine's own text for temporals, binary and semi-structured} 
         SELECT '2024-01-15'::DATE,
                '10:30:00'::TIME,
                '2024-01-15 10:30:00'::TIMESTAMP_NTZ,
-               '2024-01-15 10:30:00 +01:00'::TIMESTAMP_TZ,
                TO_BINARY('AB0102','HEX'),
                PARSE_JSON('{"a":1}'),
                ARRAY_CONSTRUCT(1,2)}]
-} -result {{2024-01-15 10:30:00 {2024-01-15 10:30:00.000} {2024-01-15 10:30:00.000 +0100} AB0102 {{"a":1}} {[1,2]}}}
+} -result {{2024-01-15 10:30:00 {2024-01-15 10:30:00.000} AB0102 {{"a":1}} {[1,2]}}}
 
 test conn-3.5 {and the helpers that convert it when a caller wants that} -constraints engine -body {
     set row [lindex [::frostlake::result rows [[ct::conn] execute \
-        {SELECT '2024-01-15 10:30:00 +01:00'::TIMESTAMP_TZ AS T, TO_BINARY('AB0102','HEX') AS B}]] 0]
+        {SELECT '2024-01-15 10:30:00'::TIMESTAMP_NTZ AS T, TO_BINARY('AB0102','HEX') AS B}]] 0]
     list [::frostlake::value parsetimestamp [lindex $row 0]] \
          [string length [::frostlake::value hextobinary [lindex $row 1]]]
-} -result {{seconds 1705311000 nanos 0 offset 3600} 3}
+} -result {{seconds 1705314600 nanos 0 offset 0} 3}
+
+# This driver supports engines older than the one that first kept the UTC offset
+# a TIMESTAMP_TZ was written with: those normalise the value and answer +0000
+# whatever went in. The two cases below SKIP against one of those rather than
+# pass, because a green run would claim an engine had been checked for something
+# it never sends.
+testConstraint tzoffset [expr {[::testserver::available] && [ct::keepsoffset]}]
+
+test conn-3.4b {a TIMESTAMP_TZ keeps the offset it was written with} -constraints tzoffset -body {
+    ::frostlake::result value [[ct::conn] execute \
+        {SELECT '2024-01-15 10:30:00 +01:00'::TIMESTAMP_TZ}]
+} -result {2024-01-15 10:30:00.000 +0100}
+
+test conn-3.4c {and the helper reads that offset back} -constraints tzoffset -body {
+    ::frostlake::value parsetimestamp [::frostlake::result value [[ct::conn] execute \
+        {SELECT '2024-01-15 10:30:00 +01:00'::TIMESTAMP_TZ}]]
+} -result {seconds 1705311000 nanos 0 offset 3600}
 
 test conn-3.5b {a real NaN from the engine arrives as the text it sent} -constraints engine -body {
     ::frostlake::result rows [[ct::conn] execute {SELECT SQRT(-1) AS N, 'NaN'::FLOAT AS F}]

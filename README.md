@@ -182,6 +182,47 @@ A transaction lives on the *session*, so anything else run on this same
 connection meanwhile joins it. Give a transaction its own connection if that is
 not what you want.
 
+## Session lifetime
+
+A connection holds one engine session, named by the first answer
+(`$conn sessionid`), and every later request carries its id.
+
+**What is sent.** An engine from 0.1.0 on reports `newSession` in its answers,
+and the first answer that names a session tells the driver which kind it is
+talking to. From then on, every request that carries the id also carries
+`requireSession: true`: the engine resumes that session or refuses the request
+with a 404, and never runs the statement in a fresh session at its default
+scope. An older engine is never sent the field.
+
+**After a lost session.** A session goes when it idles past the engine's expiry
+(30 minutes), when something releases it, or when the server restarts. On the
+404 the driver drops the id, and then:
+
+- if the session held nothing a fresh one lacks, the DSN's scope (`USE ROLE` /
+  `WAREHOUSE` / `DATABASE` / `SCHEMA`) goes on a fresh session and the
+  statement is sent **once** more — the caller sees only its result. A second
+  404 in a row raises `FROSTLAKE SESSIONLOST`;
+- if a transaction was open — `$conn begin`, or a `BEGIN` or `START
+  TRANSACTION` statement — it went with the session, and a
+  `FROSTLAKE SESSIONLOST` failure says so. The statement did not run;
+- if the session had been moved or set up — `USE`, `SET`, `UNSET`,
+  `ALTER SESSION`, a temporary object, a `CREATE` or `DROP` of a database or
+  schema — that context went with it, and a `FROSTLAKE SESSIONLOST` failure says
+  so rather than run the statement somewhere its author did not intend. It did
+  not run.
+
+Either way the connection stays usable: the next statement starts a fresh
+session on the DSN's scope. An older engine gives no such signal, so against one
+the driver keeps re-applying the DSN's scope after `-idlelimit` of idling (see
+[Connecting](#connecting)).
+
+**On `close`.** The session is released with `DELETE /api/sessions/{id}`, which
+also rolls back a transaction left open on it. It is a courtesy: bounded by the
+shorter of the `-timeout` and five seconds, and nothing it meets — a 404, a
+refusal, a server that is gone or never answers — is raised. It is sent once,
+however many times the connection is released. An older engine has no such
+endpoint and is sent nothing; its idle sweep reclaims the session.
+
 ## Failures
 
 Failures carry a Tcl `-errorcode`, which `try ... trap` matches by prefix:
@@ -193,14 +234,16 @@ try {
     # the engine refused the statement; `message` is its own wording
 } trap {FROSTLAKE CONNECTION} {message} {
     # the request never became an answer
+} trap {FROSTLAKE SESSIONLOST} {message} {
+    # the session went, taking a transaction or a context with it; nothing ran
 } trap {FROSTLAKE USAGE} {message} {
     # the driver never sent it: a bad DSN, a closed connection, a bad bind
 }
 ```
 
-`trap {FROSTLAKE}` catches all three. Each code carries a third element, a dict
+`trap {FROSTLAKE}` catches all four. Each code carries a third element, a dict
 of detail — `endpoint` and `status` for a connection failure, `statement` and
-`status` for a query failure:
+`status` for a query failure, `statement` for a lost session:
 
 ```tcl
 } trap {FROSTLAKE QUERY} {message options} {
@@ -211,7 +254,8 @@ of detail — `endpoint` and `status` for a connection failure, `statement` and
 
 A `CONNECTION` failure has an **unknown** fate: the request may have arrived and
 run before the connection broke, so the driver never re-sends it, and neither
-should you without checking.
+should you without checking. A `SESSIONLOST` failure has a known one: the
+statement never ran (see [Session lifetime](#session-lifetime)).
 
 > Binding is client-side, so the `statement` in a `QUERY` detail holds the SQL
 > *after* substitution — a bound password appears in it verbatim. The message
@@ -238,7 +282,7 @@ there rather than surfacing later on whichever query happened to run first.
 | | `-database` | the database, if not in the path |
 | `timeout` | `-timeout` | how long one statement may take (default 300s) |
 | `connectTimeout` | `-connecttimeout` | how long to wait for the socket (default 10s) |
-| `idleLimit` | `-idlelimit` | how long a connection may idle before its scope is re-applied (default 30m) |
+| `idleLimit` | `-idlelimit` | how long a connection may idle before its scope is re-applied, on an engine before 0.1.0 (default 30m) |
 | `tls` | | speak HTTPS over a `frostlake://` DSN |
 | | `-nullvalue` | the stand-in for SQL NULL (default `""`) |
 | | `-cacert` `-verify` | HTTPS trust settings |
@@ -246,12 +290,13 @@ there rather than surfacing later on whichever query happened to run first.
 Durations are written `30s`, `500ms`, `5m`, `1h`, or as a bare number of
 seconds; `0` removes the bound. An explicit option outranks the DSN.
 
-`-idlelimit` exists because the engine reclaims an idle session and then quietly
-builds a fresh one for the id the driver keeps sending — losing the scope it
-selected, with nothing in the reply to give it away. Past the limit the driver
-re-applies the DSN's scope. It does not do so once you have selected a scope
-yourself, because putting its defaults over your choice would be its own
-surprise.
+`-idlelimit` exists because an engine before 0.1.0 reclaims an idle session and
+then quietly builds a fresh one for the id the driver keeps sending — losing the
+scope it selected, with nothing in the reply to give it away. Past the limit the
+driver re-applies the DSN's scope. It does not do so once you have selected a
+scope yourself, because putting its defaults over your choice would be its own
+surprise. A later engine says itself when a session is gone (see
+[Session lifetime](#session-lifetime)), so against one the limit is not used.
 
 ### One socket per connection
 
@@ -346,8 +391,10 @@ It keeps TDBC's contract rather than the native API's:
   native API keeps the status grid those statements answer with.
 - Failures carry TDBC's `-errorcode`, `TDBC class sqlstate FROSTLAKE ...`. The
   HTTP protocol has no SQLSTATE, so a refused statement is
-  `GENERAL_ERROR HY000`. The native kind and detail dict follow the driver
-  name, so `lindex $::errorCode 5` holds a refused statement's text.
+  `GENERAL_ERROR HY000`. A lost session that took a transaction or a context
+  with it is `CONNECTION_EXCEPTION 08003`. The native kind and detail dict
+  follow the driver name, so `lindex $::errorCode 5` holds a refused
+  statement's text.
 
 Where TDBC's conventions would rewrite valid Snowflake SQL, the SQL wins. TDBC's
 tokenizer also reads `$name` and `@name` as variables, but here they are session
@@ -391,9 +438,10 @@ tclsh tests/all.tcl
 ```
 
 runs the unit tests — the JSON reader, DSN parsing, the SQL scanner, binding,
-value helpers, results, and the transport against an in-process server that can
-be made to chunk a body, close a keep-alive socket, answer something that is not
-JSON, or never answer at all. The TDBC driver's cases need the `tdbc` package
+value helpers, results, and the transport and the session handling against an
+in-process server that can be made to chunk a body, close a keep-alive socket,
+answer something that is not JSON, refuse a session it no longer holds, or never
+answer at all. The TDBC driver's cases need the `tdbc` package
 too, and skip without it.
 
 The engine-backed tests need a real engine:
@@ -403,6 +451,19 @@ JAVA_HOME=/path/to/jdk FROSTLAKE_CLASSPATH='/path/to/engine/lib/*' tclsh tests/a
 ```
 
 Without `FROSTLAKE_CLASSPATH` those cases skip rather than passing on a stub.
+
+With `FL_CORPUS` naming frostlake's `engine/src/test/resources/testkit` as
+well, the same command replays the engine-owned, language-neutral testkit
+corpus through this driver; without it the corpus is skipped. Give it as an
+absolute path, since a relative one is read from the working directory:
+
+```bash
+FL_CORPUS=/path/to/frostlake/engine/src/test/resources/testkit \
+JAVA_HOME=/path/to/jdk FROSTLAKE_CLASSPATH='/path/to/engine/lib/*' tclsh tests/all.tcl
+```
+
+Results land in `results/testkit-tcl.tsv`, and the checks the HTTP protocol
+cannot express, such as an error code, in `results/missing-apis-tcl.md`.
 
 tcltest's own options work too: `tclsh tests/all.tcl -file binding.test`,
 `-match bind-3.*`.
@@ -417,7 +478,7 @@ scanned.
 ```
 pkgIndex.tcl      what `package require` reads first
 frostlake.tcl     the package: sources the parts below, in dependency order
-errors.tcl        the three failure kinds, and the -errorcode they carry
+errors.tcl        the four failure kinds, and the -errorcode they carry
 json.tcl          a JSON reader that keeps every number's digits and every value's type
 dsn.tcl           frostlake://host:port/DB?params -> a config dict
 sql.tcl           the scanner both binding and scope-tracking read
