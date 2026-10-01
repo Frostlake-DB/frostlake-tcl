@@ -6,5 +6,5 @@
 #     package require tdbc::frostlake    ;# TDBC; needs the tdbc package too
 
 if {![package vsatisfies [package provide Tcl] 8.6-]} { return }
-package ifneeded frostlake 0.2.0 [list source [file join $dir frostlake.tcl]]
-package ifneeded tdbc::frostlake 0.2.0 [list source [file join $dir tdbcfrostlake.tcl]]
+package ifneeded frostlake 0.3.0 [list source [file join $dir frostlake.tcl]]
+package ifneeded tdbc::frostlake 0.3.0 [list source [file join $dir tdbcfrostlake.tcl]]

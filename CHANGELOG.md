@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 - Session lifetime. Against an engine that reports `newSession` (0.1.0 and
   later), every request naming the session carries `requireSession: true`, so
