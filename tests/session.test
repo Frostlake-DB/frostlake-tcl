@@ -1,0 +1,532 @@
+# How a connection keeps its idea of the engine session in step with the
+# engine's: the requireSession flag, recovery from a session the engine no
+# longer holds, and the release on close.
+#
+# The scripted cases run against the in-process fake server, where every request
+# a case makes is one it scripted; the last ones release a session behind a
+# connection's back on a real engine, and skip without one.
+
+source [file join [file dirname [info script]] helper.tcl]
+namespace import -force ::tcltest::*
+
+testConstraint engine [::testserver::available]
+testConstraint tdbc [expr {![catch {package require tdbc::frostlake}]}]
+
+namespace eval st {
+    # The answers still to give, in order, and every request after the health
+    # check as `method path body`.
+    variable script {}
+    variable requests {}
+
+    variable STATUS {{"columns":[{"dataType":"VARCHAR","name":"status","nullable":false,"precision":0,"scale":0}],"rowCount":1,"rows":[["Statement executed successfully."]],"updateCount":-1}}
+    variable SCOPE {{USE DATABASE "APP"} {USE SCHEMA "PUBLIC"}}
+
+    proc handler {method path headers body} {
+        variable script
+        variable requests
+        if {$path eq "/api/health"} {
+            return [dict create body [::fakeserver::healthy]]
+        }
+        lappend requests [list $method $path $body]
+        if {![llength $script]} {
+            return [dict create status 500 body [::fakeserver::failed "the script ran out"]]
+        }
+        set reply [lindex $script 0]
+        set script [lrange $script 1 end]
+        return $reply
+    }
+
+    # A fake server answering every request but the health check from
+    # `answers`, in order; answers its id.
+    proc serve {answers} {
+        variable script $answers
+        variable requests {}
+        return [::fakeserver::start ::st::handler]
+    }
+
+    proc dsn {id} { return "[::fakeserver::dsn $id]/APP?schema=PUBLIC" }
+
+    # A connection to a scripted engine that reports newSession, with the DSN's
+    # two USE statements already answered in session s1. Answers the server's
+    # id; the connection is `conn` in the caller.
+    proc opened {answers args} {
+        set id [serve [list [answer s1 true] [answer s1 false] {*}$answers]]
+        upvar 1 conn conn
+        set conn [::frostlake::connect [dsn $id] -timeout 300ms {*}$args]
+        return $id
+    }
+
+    proc numberset {name value} {
+        return "{\"columns\":\[{\"dataType\":\"NUMBER\",\"name\":\"$name\",\"nullable\":false,\"precision\":38,\"scale\":0}\],\"rowCount\":1,\"rows\":\[\[$value\]\],\"updateCount\":-1}"
+    }
+
+    # An answer from an engine that reports newSession (0.1.0 and later).
+    proc answer {session started {sets {}}} {
+        variable STATUS
+        if {![llength $sets]} { set sets [list $STATUS] }
+        return [dict create body "{\"errorMessage\":null,\"executionTimeMs\":1,\"newSession\":$started,\"resultSets\":\[[join $sets ,]\],\"sessionId\":\"$session\",\"success\":true}"]
+    }
+
+    # An answer from an engine that predates newSession (0.0.7).
+    proc legacy {session {sets {}}} {
+        variable STATUS
+        if {![llength $sets]} { set sets [list $STATUS] }
+        return [dict create body "{\"errorMessage\":null,\"executionTimeMs\":1,\"resultSets\":\[[join $sets ,]\],\"sessionId\":\"$session\",\"success\":true}"]
+    }
+
+    proc refused {session message} {
+        return [dict create body "{\"errorMessage\":[::frostlake::json::encode_string $message],\"executionTimeMs\":0,\"newSession\":true,\"resultSets\":\[\],\"sessionId\":\"$session\",\"success\":false}"]
+    }
+
+    # The 404 a requireSession request gets when its session is gone.
+    proc gone {session} {
+        return [dict create status 404 reason {Not Found} body "{\"errorMessage\":\"Session '$session' does not exist or has expired.\",\"executionTimeMs\":0,\"newSession\":false,\"resultSets\":\[\],\"sessionId\":null,\"success\":false}"]
+    }
+
+    proc released {} {
+        return [dict create body {{"errorMessage":null,"executionTimeMs":0,"newSession":false,"resultSets":[],"sessionId":null,"success":true}}]
+    }
+
+    # The requests of one method.
+    proc sent {{method POST}} {
+        variable requests
+        set out {}
+        foreach request $requests {
+            if {[lindex $request 0] eq $method} { lappend out $request }
+        }
+        return $out
+    }
+
+    # The SQL of every POST /api/execute, in order.
+    proc statements {} {
+        set out {}
+        foreach request [sent POST] {
+            lappend out [field $request sql]
+        }
+        return $out
+    }
+
+    # One field of a request's body, or "missing" when it carried none.
+    proc field {request key} {
+        set body [::frostlake::json parse [lindex $request 2]]
+        if {![::frostlake::json exists $body $key]} { return missing }
+        return [::frostlake::json value [::frostlake::json at $body $key]]
+    }
+
+    # The -errorcode's first two elements and whether the message holds `word`.
+    proc failure {script word} {
+        if {![catch {uplevel 1 $script} message options]} { return "no error" }
+        return [list [lrange [dict get $options -errorcode] 0 1] \
+                     [string match "*$word*" $message]]
+    }
+}
+
+# ---------------------------------------------------------------- the flag
+
+test session-1.1 {requireSession is never sent to an engine that predates newSession} -body {
+    set id [st::serve [list [st::legacy old1] [st::legacy old1] \
+                            [st::legacy old1 [list [st::numberset N 1]]]]]
+    try {
+        set conn [::frostlake::connect [st::dsn $id]]
+        $conn execute {SELECT 1 AS N}
+        set flags {}
+        foreach request [st::sent] { lappend flags [st::field $request requireSession] }
+        set ids [list [st::field [lindex [st::sent] 0] sessionId] \
+                      [st::field [lindex [st::sent] 2] sessionId]]
+        # And an engine without newSession has no DELETE /api/sessions either.
+        $conn close
+        list $flags $ids [llength $st::requests]
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {{missing missing missing} {missing old1} 3}
+
+test session-1.2 {and is sent on every request naming the session once it is known} -body {
+    set id [st::opened [list [st::answer s1 false [list [st::numberset N 1]]]]]
+    try {
+        $conn execute {SELECT 1 AS N}
+        set out {}
+        foreach request [st::sent] {
+            lappend out [list [st::field $request sessionId] [st::field $request requireSession]]
+        }
+        set out
+    } finally {
+        catch {$conn close}
+        ::fakeserver::stop $id
+    }
+} -result {{missing missing} {s1 1} {s1 1}}
+
+# --------------------------------------------------------- a lost session
+
+test session-2.1 {a lost session is replaced on the DSN's scope, and the statement sent once more} -body {
+    set id [st::opened [list [st::gone s1] [st::answer s2 true] [st::answer s2 false] \
+                             [st::answer s2 false [list [st::numberset N 1]]]]]
+    try {
+        set value [::frostlake::result value [$conn execute {SELECT 1 AS N}]]
+        set sent [st::sent]
+        list $value [expr {[st::statements] eq [list {*}$st::SCOPE {SELECT 1 AS N} \
+                                                      {*}$st::SCOPE {SELECT 1 AS N}]}] \
+             [st::field [lindex $sent 3] sessionId] [st::field [lindex $sent 5] sessionId] \
+             [$conn sessionid]
+    } finally {
+        catch {$conn close}
+        ::fakeserver::stop $id
+    }
+} -result {1 1 missing s2 s2}
+
+test session-2.2 {a session lost again straight away is reported, and the connection goes on} -body {
+    set id [st::opened [list [st::gone s1] [st::answer s2 true] [st::answer s2 false] \
+                             [st::gone s2] \
+                             [st::answer s3 true] [st::answer s3 false] \
+                             [st::answer s3 false [list [st::numberset N 2]]]]]
+    try {
+        set failure [st::failure {$conn execute {SELECT 1 AS N}} started]
+        set sends [llength [lsearch -all -exact [st::statements] {SELECT 1 AS N}]]
+        list $failure $sends [::frostlake::result value [$conn execute {SELECT 2 AS N}]] \
+             [$conn sessionid]
+    } finally {
+        catch {$conn close}
+        ::fakeserver::stop $id
+    }
+} -result {{{FROSTLAKE SESSIONLOST} 1} 2 2 s3}
+
+test session-2.3 {a lost session that held a transaction is reported, not replaced} -body {
+    set id [st::opened [list [st::answer s1 false] [st::gone s1] \
+                             [st::answer s2 true] [st::answer s2 false] \
+                             [st::answer s2 false [list [st::numberset N 1]]]]]
+    try {
+        $conn begin
+        set before [$conn intransaction]
+        set failure [st::failure {$conn execute {INSERT INTO t VALUES (1)}} transaction]
+        set statement [dict get [::frostlake::detail $::errorCode] statement]
+        set after [$conn intransaction]
+        # The next statement starts over on the DSN's scope.
+        set value [::frostlake::result value [$conn execute {SELECT 1 AS N}]]
+        set sent [st::sent]
+        list $before $failure $statement $after $value \
+             [expr {[st::statements] eq [list {*}$st::SCOPE BEGIN {INSERT INTO t VALUES (1)} \
+                                              {*}$st::SCOPE {SELECT 1 AS N}]}] \
+             [st::field [lindex $sent 4] sessionId] [st::field [lindex $sent 6] autoCommit]
+    } finally {
+        catch {$conn close}
+        ::fakeserver::stop $id
+    }
+} -result {1 {{FROSTLAKE SESSIONLOST} 1} {INSERT INTO t VALUES (1)} 0 1 1 missing 1}
+
+test session-2.4 {a transaction a statement opened is tracked too} -body {
+    set out {}
+    foreach opener {BEGIN {BEGIN TRANSACTION} {START TRANSACTION}} {
+        set id [st::opened [list [st::answer s1 false] [st::gone s1]]]
+        try {
+            $conn execute $opener
+            lappend out [st::failure {$conn execute {SELECT 1}} transaction] \
+                        [expr {[st::statements] eq [list {*}$st::SCOPE $opener {SELECT 1}]}]
+        } finally {
+            catch {$conn close}
+            ::fakeserver::stop $id
+        }
+    }
+    # And one that was committed is no longer there to lose.
+    set id [st::opened [list [st::answer s1 false] [st::answer s1 false] [st::gone s1] \
+                             [st::answer s2 true] [st::answer s2 false] \
+                             [st::answer s2 false [list [st::numberset N 1]]]]]
+    try {
+        $conn execute BEGIN
+        $conn execute COMMIT
+        lappend out [::frostlake::result value [$conn execute {SELECT 1 AS N}]]
+    } finally {
+        catch {$conn close}
+        ::fakeserver::stop $id
+    }
+    set out
+} -result {{{FROSTLAKE SESSIONLOST} 1} 1 {{FROSTLAKE SESSIONLOST} 1} 1 {{FROSTLAKE SESSIONLOST} 1} 1 1}
+
+test session-2.5 {a lost session whose context moved is reported, not replaced} -body {
+    set out {}
+    foreach mover {{USE SCHEMA other} {SET v = 1} {UNSET v}
+                   {ALTER SESSION SET TIMEZONE = 'UTC'}
+                   {CREATE TEMPORARY TABLE tmp (i INT)} {CREATE DATABASE other}
+                   {SELECT 1; USE SCHEMA other}} {
+        set id [st::opened [list [st::answer s1 false] [st::gone s1]]]
+        try {
+            $conn execute $mover
+            set failure [st::failure {$conn execute {SELECT * FROM t}} context]
+            # Not sent a second time.
+            set once [expr {[st::statements] eq [list {*}$st::SCOPE $mover {SELECT * FROM t}]}]
+            if {$failure ne {{FROSTLAKE SESSIONLOST} 1} || !$once} {
+                lappend out [list $mover $failure $once]
+            }
+        } finally {
+            catch {$conn close}
+            ::fakeserver::stop $id
+        }
+    }
+    set out
+} -result {}
+
+test session-2.6 {after the report the connection starts over on the DSN's scope} -body {
+    set id [st::opened [list [st::answer s1 false] [st::gone s1] \
+                             [st::answer s2 true] [st::answer s2 false] \
+                             [st::answer s2 false [list [st::numberset N 1]]]]]
+    try {
+        $conn execute {USE SCHEMA other}
+        catch {$conn execute {SELECT 0}}
+        set value [::frostlake::result value [$conn execute {SELECT 1 AS N}]]
+        list $value [expr {[st::statements] eq [list {*}$st::SCOPE {USE SCHEMA other} {SELECT 0} \
+                                                     {*}$st::SCOPE {SELECT 1 AS N}]}]
+    } finally {
+        catch {$conn close}
+        ::fakeserver::stop $id
+    }
+} -result {1 1}
+
+test session-2.7 {a scope lost part way goes back on whole} -body {
+    # The scope that goes back on before the next statement -- after an answer
+    # that said the engine replaced the session -- meets a session gone again.
+    set id [st::opened [list [st::answer s1 true [list [st::numberset N 1]]] \
+                             [st::gone s1] [st::answer s2 true] [st::answer s2 false] \
+                             [st::answer s2 false [list [st::numberset N 2]]]]]
+    try {
+        $conn execute {SELECT 1 AS N}
+        set value [::frostlake::result value [$conn execute {SELECT 2 AS N}]]
+        list $value [expr {[st::statements] eq [list {*}$st::SCOPE {SELECT 1 AS N} \
+                                                     [lindex $st::SCOPE 0] {*}$st::SCOPE \
+                                                     {SELECT 2 AS N}]}]
+    } finally {
+        catch {$conn close}
+        ::fakeserver::stop $id
+    }
+} -result {2 1}
+
+test session-2.8 {a server that replaced the session gets the scope back first} -body {
+    set id [st::opened [list [st::answer s1 true [list [st::numberset N 1]]] \
+                             [st::answer s1 false] [st::answer s1 false] \
+                             [st::answer s1 false [list [st::numberset N 2]]]]]
+    try {
+        $conn execute {SELECT 1 AS N}
+        $conn execute {SELECT 2 AS N}
+        expr {[st::statements] eq [list {*}$st::SCOPE {SELECT 1 AS N} {*}$st::SCOPE {SELECT 2 AS N}]}
+    } finally {
+        catch {$conn close}
+        ::fakeserver::stop $id
+    }
+} -result 1
+
+test session-2.9 {the idle re-scope is left to the engines that need it} -body {
+    # An engine that reports newSession refuses a session it no longer holds, so
+    # an idle connection to one does not guess: no scope goes back on.
+    set id [st::opened [list [st::answer s1 false [list [st::numberset N 1]]]] -idlelimit 50ms]
+    try {
+        after 100
+        $conn execute {SELECT 1 AS N}
+        expr {[st::statements] eq [list {*}$st::SCOPE {SELECT 1 AS N}]}
+    } finally {
+        catch {$conn close}
+        ::fakeserver::stop $id
+    }
+} -result 1
+
+# ------------------------------------------------------------------ closing
+
+test session-3.1 {close releases the session, once} -body {
+    set id [st::opened [list [st::answer s1 false] [st::released]]]
+    try {
+        $conn begin
+        $conn close
+        set deletes [st::sent DELETE]
+        list [llength $deletes] [lindex $deletes 0 1]
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {1 /api/sessions/s1}
+
+test session-3.2 {closing never raises, whatever the release meets} -body {
+    set out {}
+    foreach {what reply} [list \
+            404 [dict create status 404 body {{"success":false,"sessionId":null}}] \
+            405 [dict create status 405 body {{"error":"Method not allowed"}}] \
+            closed [dict create raw ""] \
+            silent [dict create silent 1]] {
+        set id [st::opened [list $reply]]
+        try {
+            set started [clock milliseconds]
+            set code [catch {$conn close} message]
+            # Bounded by the connection's own 300ms, not by the five seconds a
+            # slower connection would get.
+            set quick [expr {[clock milliseconds] - $started < 3000}]
+            if {$code || !$quick || [llength [st::sent DELETE]] != 1} {
+                lappend out [list $what $code $message $quick [llength [st::sent DELETE]]]
+            }
+        } finally {
+            ::fakeserver::stop $id
+        }
+    }
+    # A server that has gone altogether: the last answer closes the socket, and
+    # nothing is listening any more when the release reconnects.
+    set id [st::opened [list [dict merge [st::answer s1 false] {close 1}]]]
+    $conn execute {SELECT 1}
+    ::fakeserver::stop $id
+    if {[catch {$conn close} message]} { lappend out [list gone $message] }
+    set out
+} -result {}
+
+test session-3.3 {a scope the engine refuses fails the connect and releases the session} -body {
+    set id [st::serve [list [st::refused s9 "Database 'APP' does not exist or not authorized."] \
+                            [st::released]]]
+    try {
+        set failure [st::failure {::frostlake::connect [st::dsn $id]} APP]
+        # The constructor releases, and so does the destructor TclOO runs after a
+        # failed constructor: the session still goes once.
+        set deletes [st::sent DELETE]
+        list $failure [llength $deletes] [lindex $deletes 0 1]
+    } finally {
+        ::fakeserver::stop $id
+    }
+} -result {{{FROSTLAKE QUERY} 1} 1 /api/sessions/s9}
+
+test session-3.4 {TDBC reports a lost session as SQLSTATE 08003, and closing releases it} -constraints tdbc -body {
+    set id [st::serve [list [st::answer s1 true] [st::answer s1 false] [st::answer s1 false] \
+                            [st::gone s1] [st::answer s2 true] [st::answer s2 false] \
+                            [st::released]]]
+    try {
+        ::tdbc::frostlake::connection create ::sessiondb [st::dsn $id]
+        ::sessiondb allrows {SET v = 1}
+        catch {::sessiondb allrows {SELECT $v}} message options
+        set code [lrange [dict get $options -errorcode] 0 4]
+        # The next statement runs in a fresh session, which closing releases.
+        ::sessiondb allrows {SELECT 1}
+        ::sessiondb close
+        list $code [lindex [st::sent DELETE] 0 1]
+    } finally {
+        catch {::sessiondb close}
+        ::fakeserver::stop $id
+    }
+} -result {{TDBC CONNECTION_EXCEPTION 08003 FROSTLAKE SESSIONLOST} /api/sessions/s2}
+
+# ---------------------------------------------------------- statement kinds
+
+test session-4.1 {the statements that leave state behind} -body {
+    set out {}
+    foreach sql {{USE SCHEMA other} {SET v = 1} {UNSET v} {ALTER SESSION SET TIMEZONE = 'UTC'}
+                 {CREATE DATABASE d} {DROP SCHEMA IF EXISTS s} {CREATE TEMPORARY TABLE t (i INT)}
+                 {CREATE OR REPLACE TEMP VIEW v AS SELECT 1} {CREATE LOCAL TEMPORARY TABLE t (i INT)}
+                 {create volatile table t (i int)}} {
+        if {![::frostlake::sql touchessession $sql]} { lappend out $sql }
+    }
+    foreach sql {{SELECT 1} {CREATE TABLE t (i INT)} {CREATE TRANSIENT TABLE t (i INT)}
+                 {DROP TABLE t} {INSERT INTO t VALUES (1)} {SELECT 'USE SCHEMA x'} {}} {
+        if {[::frostlake::sql touchessession $sql]} { lappend out $sql }
+    }
+    set out
+} -result {}
+
+test session-4.2 {the statements that open and end a transaction} -body {
+    set out {}
+    foreach sql [list BEGIN {begin transaction} {BEGIN WORK} {BEGIN NAME t1} \
+                      {START TRANSACTION} "  -- open one\n BEGIN" \
+                      COMMIT {commit work} ROLLBACK \
+                      {BEGIN SELECT 1} {SELECT 1} BEGIN_X STARTED] {
+        lappend out [::frostlake::sql transactioneffect $sql]
+    }
+    set out
+} -result {begins begins begins begins begins begins ends ends ends {} {} {} {}}
+
+# ------------------------------------------------------------ a live engine
+
+namespace eval st {
+    proc enginedsn {} { return [dict get [::testserver::shared] dsn] }
+
+    # One raw request to the engine, beside any connection: its status and its
+    # body, parsed.
+    proc enginerequest {method path} {
+        set config [::frostlake::dsn::parse [enginedsn]]
+        dict set config timeout 30000
+        set sock [::frostlake::http::connect $config]
+        try {
+            set reply [::frostlake::http::exchange $sock $config $method $path ""]
+        } finally {
+            ::frostlake::http::disconnect $sock
+        }
+        return [list [dict get $reply status] [::frostlake::json parse [dict get $reply body]]]
+    }
+
+    proc activesessions {} {
+        lassign [enginerequest GET /api/sessions] status body
+        return [::frostlake::json value [::frostlake::json at $body activeSessions]]
+    }
+
+    # Releases a connection's session the way an expiry or a restart would lose it.
+    proc releasebehinditsback {conn} {
+        return [lindex [enginerequest DELETE "/api/sessions/[$conn sessionid]"] 0]
+    }
+
+    # This driver quotes a DSN's names exactly as given, so the DSN names the
+    # upper-case objects the unquoted names fold to.
+    proc scopeddsn {} {
+        set setup [::frostlake::connect [enginedsn]]
+        $setup execute {CREATE DATABASE IF NOT EXISTS tcl_session_db}
+        $setup execute {USE DATABASE tcl_session_db}
+        $setup execute {CREATE SCHEMA IF NOT EXISTS tcl_session_schema}
+        $setup close
+        return "[enginedsn]/TCL_SESSION_DB?schema=TCL_SESSION_SCHEMA"
+    }
+}
+
+test session-5.1 {a session released behind the connection's back is replaced on the DSN's scope} -constraints engine -body {
+    set conn [::frostlake::connect [st::scopeddsn]]
+    try {
+        set first [$conn sessionid]
+        set status [st::releasebehinditsback $conn]
+        list $status \
+             [::frostlake::result value [$conn execute {SELECT CURRENT_DATABASE()}]] \
+             [::frostlake::result value [$conn execute {SELECT CURRENT_SCHEMA()}]] \
+             [expr {[$conn sessionid] ne $first}]
+    } finally {
+        $conn close
+    }
+} -result {200 TCL_SESSION_DB TCL_SESSION_SCHEMA 1}
+
+test session-5.2 {one that held a transaction is reported, and the release rolled it back} -constraints engine -body {
+    set conn [::frostlake::connect [st::scopeddsn]]
+    try {
+        $conn execute {CREATE OR REPLACE TABLE lost_tx (i INT)}
+        $conn begin
+        $conn execute {INSERT INTO lost_tx VALUES (1)}
+        st::releasebehinditsback $conn
+        set failure [st::failure {$conn execute {INSERT INTO lost_tx VALUES (2)}} transaction]
+        list $failure [$conn intransaction] \
+             [::frostlake::result value [$conn execute {SELECT COUNT(*) FROM lost_tx}]] \
+             [::frostlake::result value [$conn execute {SELECT CURRENT_SCHEMA()}]]
+    } finally {
+        $conn close
+    }
+} -result {{{FROSTLAKE SESSIONLOST} 1} 0 0 TCL_SESSION_SCHEMA}
+
+test session-5.3 {one whose context moved is reported} -constraints engine -body {
+    set conn [::frostlake::connect [st::scopeddsn]]
+    try {
+        $conn execute {SET v = 41}
+        st::releasebehinditsback $conn
+        list [st::failure {$conn execute {SELECT $v + 1}} context] \
+             [::frostlake::result value [$conn execute {SELECT CURRENT_DATABASE()}]]
+    } finally {
+        $conn close
+    }
+} -result {{{FROSTLAKE SESSIONLOST} 1} TCL_SESSION_DB}
+
+test session-5.4 {closing releases the session} -constraints engine -body {
+    set before [st::activesessions]
+    set conn [::frostlake::connect [st::enginedsn]]
+    $conn execute {SELECT 1}
+    set during [st::activesessions]
+    $conn close
+    list [expr {$during - $before}] [expr {[st::activesessions] - $before}]
+} -cleanup {
+    catch {
+        set cleanup [::frostlake::connect [st::enginedsn]]
+        $cleanup execute {DROP DATABASE IF EXISTS tcl_session_db}
+        $cleanup close
+    }
+} -result {1 0}
+
+cleanupTests
